@@ -11,6 +11,8 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 from pathlib import Path
+from urllib.parse import urlparse
+import decouple
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,12 +22,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-z**kdo852!-@0!u7nplffx0y@b_3t%+23j2w_id8*943f%sc45'
+SECRET_KEY = decouple.config('SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = decouple.config('DEBUG', default=True, cast=bool)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = decouple.config('ALLOWED_HOSTS', default='*', cast=list)
 
 
 # Application definition
@@ -37,6 +39,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'mainapp.apps.MainappConfig',
 ]
 
 MIDDLEWARE = [
@@ -45,6 +48,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'mainapp.middleware.ActiveSessionEnforcementMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -74,8 +78,12 @@ WSGI_APPLICATION = 'jojoCRM.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': decouple.config('DB_NAME'),
+        'USER': decouple.config('DB_USER'),
+        'PASSWORD': decouple.config('DB_PASSWORD'),
+        'HOST': decouple.config('DB_HOST'),
+        # 'PORT': decouple.config('DB_PORT'),
     }
 }
 
@@ -116,12 +124,125 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+AUTH_USER_MODEL = 'mainapp.User'
+
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in decouple.config(
+        'CSRF_TRUSTED_ORIGINS',
+        default='http://localhost:5173,http://127.0.0.1:5173',
+    ).split(',')
+    if origin.strip()
+]
+
+# Geolocation (IPinfo)
+IPINFO_TOKEN = decouple.config('IPINFO_TOKEN', default='')
+GEO_LOOKUP_IP = decouple.config('GEO_LOOKUP_IP', default='')
+GEO_LOOKUP_TIMEOUT = decouple.config(
+    'GEO_LOOKUP_TIMEOUT',
+    default='3.0',
+    cast=lambda v: float(v.strip()) if v and v.strip() else 3.0,
+)
+TRUSTED_PROXY_IPS = [
+    ip.strip()
+    for ip in decouple.config('TRUSTED_PROXY_IPS', default='').split(',')
+    if ip.strip()
+]
+BYPASS_GEO_CHECK = decouple.config('BYPASS_GEO_CHECK', default=False, cast=bool)
+
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
-    },
-}
+def _clean_env_str(val):
+    if val is None:
+        return ''
+    return str(val).strip().strip("'").strip('"')
+
+
+EMAIL_BACKEND = decouple.config(
+    'EMAIL_BACKEND',
+    default='django.core.mail.backends.smtp.EmailBackend',
+)
+SERVER_EMAIL_HOST = _clean_env_str(decouple.config('SERVER_EMAIL_HOST', default='smtp.gmail.com'))
+SERVER_EMAIL_PORT = decouple.config(
+    'SERVER_EMAIL_PORT',
+    default='465',
+    cast=lambda v: int(str(v).strip().strip("'").strip('"')) if v and str(v).strip() else 465,
+)
+SERVER_EMAIL = _clean_env_str(decouple.config('SERVER_EMAIL', default=''))
+SERVER_EMAIL_PASSWORD = _clean_env_str(decouple.config('SERVER_EMAIL_PASSWORD', default=''))
+SERVER_EMAIL_USE_TLS = decouple.config('SERVER_EMAIL_USE_TLS', default=False, cast=bool)
+SERVER_EMAIL_USE_SSL = decouple.config('SERVER_EMAIL_USE_SSL', default=True, cast=bool)
+EMAIL_TIMEOUT = decouple.config('EMAIL_TIMEOUT', default=10, cast=int)
+
+EMAIL_HOST = SERVER_EMAIL_HOST
+EMAIL_PORT = SERVER_EMAIL_PORT
+EMAIL_HOST_USER = SERVER_EMAIL
+EMAIL_HOST_PASSWORD = SERVER_EMAIL_PASSWORD
+EMAIL_USE_TLS = SERVER_EMAIL_USE_TLS
+EMAIL_USE_SSL = SERVER_EMAIL_USE_SSL
+DEFAULT_FROM_EMAIL = _clean_env_str(decouple.config('DEFAULT_FROM_EMAIL', default='')) or SERVER_EMAIL
+
+INVITE_TTL_HOURS = decouple.config(
+    'INVITE_TTL_HOURS',
+    default='24',
+    cast=lambda v: max(1, int(str(v).strip().strip("'").strip('"'))) if v and str(v).strip() else 24,
+)
+
+APP_BASE_URL = _clean_env_str(
+    decouple.config('APP_BASE_URL', default='http://localhost:5173')
+).rstrip('/')
+
+_PARSED_APP_URL = urlparse(APP_BASE_URL)
+
+# OAuth / OIDC sign-in providers (identity scopes only; fail closed when unset)
+GOOGLE_OAUTH_CLIENT_ID = _clean_env_str(
+    decouple.config('GOOGLE_OAUTH_CLIENT_ID', default='')
+)
+GOOGLE_OAUTH_CLIENT_SECRET = _clean_env_str(
+    decouple.config('GOOGLE_OAUTH_CLIENT_SECRET', default='')
+)
+GOOGLE_OAUTH_REDIRECT_URI = (
+    _clean_env_str(decouple.config('GOOGLE_OAUTH_REDIRECT_URI', default=''))
+    or f"{APP_BASE_URL}/api/v1/auth/google/callback/"
+)
+
+MICROSOFT_OAUTH_CLIENT_ID = _clean_env_str(
+    decouple.config('MICROSOFT_OAUTH_CLIENT_ID', default='')
+)
+MICROSOFT_OAUTH_CLIENT_SECRET = _clean_env_str(
+    decouple.config('MICROSOFT_OAUTH_CLIENT_SECRET', default='')
+)
+MICROSOFT_OAUTH_TENANT_ID = (
+    _clean_env_str(decouple.config('MICROSOFT_OAUTH_TENANT_ID', default='common'))
+    or 'common'
+)
+MICROSOFT_OAUTH_REDIRECT_URI = (
+    _clean_env_str(decouple.config('MICROSOFT_OAUTH_REDIRECT_URI', default=''))
+    or f"{APP_BASE_URL}/api/v1/auth/microsoft/callback/"
+)
+
+OAUTH_HTTP_TIMEOUT = decouple.config(
+    'OAUTH_HTTP_TIMEOUT',
+    default='10.0',
+    cast=lambda v: float(str(v).strip()) if v and str(v).strip() else 10.0,
+)
+
+# Passkeys (WebAuthn)
+WEBAUTHN_RP_ID = (
+    _clean_env_str(decouple.config('WEBAUTHN_RP_ID', default=''))
+    or (_PARSED_APP_URL.hostname or 'localhost')
+)
+WEBAUTHN_RP_NAME = (
+    _clean_env_str(decouple.config('WEBAUTHN_RP_NAME', default='jojoCRM'))
+    or 'jojoCRM'
+)
+WEBAUTHN_ORIGIN = (
+    _clean_env_str(decouple.config('WEBAUTHN_ORIGIN', default=''))
+    or APP_BASE_URL
+)
+
+
