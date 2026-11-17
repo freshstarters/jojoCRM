@@ -13,3 +13,4 @@ Story documentation:
 - [docs/S1_5_OWNER_STAFF_AND_AUDIT.md](docs/S1_5_OWNER_STAFF_AND_AUDIT.md) — S1.5 Owner and Staff roles, member deactivation and reactivation, session recovery, account settings, and audit logging.
 - [docs/S2_0_BUSINESS_TYPE_AND_PACKS.md](docs/S2_0_BUSINESS_TYPE_AND_PACKS.md) — S2.0 20-type workspace catalog, starter packs, Contact labels, empty-table protection, and URL pane/subtab persistence.
 - [docs/S2_1_CORE_AND_PACK_OBJECTS.md](docs/S2_1_CORE_AND_PACK_OBJECTS.md) — S2.1 Account, Contact, Lead, Deal, Activity, Job, Appointment, and Ticket models, CRUD APIs, role permissions matrix, and workspace panes.
+- [docs/S2_2_LEAD_CONVERSION.md](docs/S2_2_LEAD_CONVERSION.md) — S2.2 Lead-to-Deal conversion, Account/Contact match detection and reuse, double-conversion protection, converted Lead locks, and pack gating.
