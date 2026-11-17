@@ -64,6 +64,13 @@ class Account(WorkspaceRecordBase):
     phone = models.CharField(max_length=64, blank=True, default='')
     email = models.CharField(max_length=254, blank=True, default='')
     notes = models.TextField(blank=True, default='')
+    source_lead = models.ForeignKey(
+        'mainapp.Lead',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='converted_accounts',
+    )
 
     class Meta:
         ordering = ['-updated_at', '-id']
@@ -94,6 +101,13 @@ class Contact(WorkspaceRecordBase):
     phone = models.CharField(max_length=64, blank=True, default='')
     sms_consent = models.BooleanField(default=False)
     notes = models.TextField(blank=True, default='')
+    source_lead = models.ForeignKey(
+        'mainapp.Lead',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='converted_contacts',
+    )
 
     class Meta:
         ordering = ['-updated_at', '-id']
@@ -124,6 +138,35 @@ class Lead(WorkspaceRecordBase):
     sms_consent = models.BooleanField(default=False)
     status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_OPEN)
     notes = models.TextField(blank=True, default='')
+    converted_at = models.DateTimeField(null=True, blank=True)
+    converted_by = models.ForeignKey(
+        'mainapp.User',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='converted_leads',
+    )
+    converted_account = models.ForeignKey(
+        'mainapp.Account',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='source_leads',
+    )
+    converted_contact = models.ForeignKey(
+        'mainapp.Contact',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='source_leads',
+    )
+    converted_deal = models.ForeignKey(
+        'mainapp.Deal',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='source_leads',
+    )
 
     class Meta:
         ordering = ['-updated_at', '-id']
@@ -167,6 +210,13 @@ class Deal(WorkspaceRecordBase):
         blank=True,
     )
     notes = models.TextField(blank=True, default='')
+    source_lead = models.ForeignKey(
+        'mainapp.Lead',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='converted_deals',
+    )
 
     class Meta:
         ordering = ['-updated_at', '-id']
