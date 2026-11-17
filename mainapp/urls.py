@@ -15,6 +15,13 @@ from .views.auth_views import (
     signup_view,
     verify_email_view,
 )
+from .views.crm_views import (
+    workspace_crm_options_view,
+    workspace_dashboard_view,
+    workspace_record_activities_view,
+    workspace_record_collection_view,
+    workspace_record_detail_view,
+)
 from .views.invite_views import (
     invite_accept_view,
     invite_preview_view,
@@ -46,6 +53,7 @@ from .views.workspace_access_views import (
     workspace_member_deactivate_view,
     workspace_member_delete_view,
     workspace_member_reactivate_view,
+    workspace_role_detail_view,
     workspace_roles_view,
 )
 from .views.workspace_views import (
@@ -143,6 +151,28 @@ urlpatterns = [
         name='workspace_member_reactivate',
     ),
     path('workspaces/<slug:slug>/roles/', workspace_roles_view, name='workspace_roles'),
+    path(
+        'workspaces/<slug:slug>/roles/<int:role_id>/',
+        workspace_role_detail_view,
+        name='workspace_role_detail',
+    ),
+    path('workspaces/<slug:slug>/dashboard/', workspace_dashboard_view, name='workspace_dashboard'),
+    path('workspaces/<slug:slug>/crm/options/', workspace_crm_options_view, name='workspace_crm_options'),
+    path(
+        'workspaces/<slug:slug>/records/<str:object_key>/',
+        workspace_record_collection_view,
+        name='workspace_record_collection',
+    ),
+    path(
+        'workspaces/<slug:slug>/records/<str:object_key>/<int:record_id>/',
+        workspace_record_detail_view,
+        name='workspace_record_detail',
+    ),
+    path(
+        'workspaces/<slug:slug>/records/<str:object_key>/<int:record_id>/activities/',
+        workspace_record_activities_view,
+        name='workspace_record_activities',
+    ),
     path('workspaces/<slug:slug>/packs/', workspace_packs_view, name='workspace_packs'),
     path(
         'workspaces/<slug:slug>/tables/<str:object_key>/',

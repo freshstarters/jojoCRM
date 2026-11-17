@@ -6,7 +6,11 @@ from django.http import JsonResponse
 from django.views.decorators.http import require_GET, require_http_methods
 
 from ..catalog import BUSINESS_TYPES_BY_KEY
-from ..helpers.request_helpers import parse_json_object, require_workspace_member
+from ..helpers.request_helpers import (
+    parse_json_object,
+    parse_positive_int,
+    require_workspace_member,
+)
 from ..models import AuditLog, Workspace
 from ..serializers import serialize_workspace_and_user
 from ..service.audit_service import (
@@ -49,20 +53,6 @@ def _require_catalog_management_permission(request, slug: str):
             ),
         )
     return user, workspace, None
-
-
-def _parse_positive_int(raw_value, *, default: int, name: str, maximum: int | None = None):
-    if raw_value is None or raw_value == '':
-        return default, None
-    try:
-        parsed = int(raw_value)
-    except (TypeError, ValueError):
-        return None, JsonResponse({'error': f'{name} must be a positive integer.'}, status=400)
-    if parsed < 1:
-        return None, JsonResponse({'error': f'{name} must be at least 1.'}, status=400)
-    if maximum is not None and parsed > maximum:
-        parsed = maximum
-    return parsed, None
 
 
 @require_http_methods(["GET", "PATCH"])
@@ -281,13 +271,13 @@ def workspace_audit_view(request, slug: str):
     if error_response is not None:
         return error_response
 
-    page, page_error = _parse_positive_int(
+    page, page_error = parse_positive_int(
         request.GET.get('page'), default=1, name='page'
     )
     if page_error is not None:
         return page_error
 
-    page_size, size_error = _parse_positive_int(
+    page_size, size_error = parse_positive_int(
         request.GET.get('page_size'),
         default=DEFAULT_AUDIT_PAGE_SIZE,
         name='page_size',
