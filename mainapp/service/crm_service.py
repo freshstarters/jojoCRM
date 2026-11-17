@@ -504,6 +504,89 @@ def _serialize_contact_ref(contact: Contact | None) -> dict | None:
     }
 
 
+def _serialize_lead_ref(lead: Lead | None) -> dict | None:
+    if lead is None:
+        return None
+    return {
+        'id': lead.id,
+        'record_code': f'{RECORD_CODE_PREFIXES["lead"]}-{lead.id}',
+        'name': lead.name,
+        'company': lead.company,
+        'email': lead.email,
+        'phone': lead.phone,
+        'status': lead.status,
+    }
+
+
+def _serialize_deal_ref(deal: Deal | None) -> dict | None:
+    if deal is None:
+        return None
+    return {
+        'id': deal.id,
+        'record_code': f'{RECORD_CODE_PREFIXES["deal"]}-{deal.id}',
+        'title': deal.title,
+        'stage': deal.stage,
+        'amount': f'{deal.amount:.2f}',
+    }
+
+
+def is_lead_conversion_available(workspace) -> bool:
+    """Return True when the workspace has Account, Contact, Lead, and Deal enabled."""
+    if workspace is None:
+        return False
+    ensure_workspace_catalog(workspace)
+    enabled = set(
+        WorkspaceTable.objects.filter(
+            workspace=workspace,
+            object_key__in=('account', 'contact', 'lead', 'deal'),
+            is_enabled=True,
+        ).values_list('object_key', flat=True)
+    )
+    return enabled == {'account', 'contact', 'lead', 'deal'}
+
+
+def get_lead_conversion_capability(user, workspace) -> dict:
+    """Compute whether the workspace supports lead conversion and what the caller role can do."""
+    available = is_lead_conversion_available(workspace)
+    if not available:
+        return {
+            'conversion_available': False,
+            'can_convert_lead': False,
+            'can_update_lead': False,
+            'can_create_account': False,
+            'can_reuse_account': False,
+            'can_create_contact': False,
+            'can_reuse_contact': False,
+            'can_update_contact': False,
+            'can_create_deal': False,
+        }
+
+    can_update_lead = user_has_object_right(user, workspace, 'lead', 'update')
+    can_create_account = user_has_object_right(user, workspace, 'account', 'create')
+    can_reuse_account = user_has_object_right(user, workspace, 'account', 'read')
+    can_create_contact = user_has_object_right(user, workspace, 'contact', 'create')
+    can_reuse_contact = user_has_object_right(user, workspace, 'contact', 'read')
+    can_update_contact = user_has_object_right(user, workspace, 'contact', 'update')
+    can_create_deal = user_has_object_right(user, workspace, 'deal', 'create')
+    can_convert = bool(
+        can_update_lead
+        and can_create_deal
+        and (can_create_account or can_reuse_account)
+        and (can_create_contact or can_reuse_contact)
+    )
+    return {
+        'conversion_available': True,
+        'can_convert_lead': can_convert,
+        'can_update_lead': can_update_lead,
+        'can_create_account': can_create_account,
+        'can_reuse_account': can_reuse_account,
+        'can_create_contact': can_create_contact,
+        'can_reuse_contact': can_reuse_contact,
+        'can_update_contact': can_update_contact,
+        'can_create_deal': can_create_deal,
+    }
+
+
 def _resolve_target_record_label(workspace, target_type: str, target_id: int) -> str:
     model_cls = CRM_MODELS_BY_KEY.get(target_type)
     if model_cls is None:
@@ -547,6 +630,7 @@ def serialize_crm_record(
     }
 
     if object_key == 'account':
+        source_lead_ref = _serialize_lead_ref(record.source_lead)
         data.update(
             {
                 'name': record.name,
@@ -555,9 +639,14 @@ def serialize_crm_record(
                 'email': record.email,
                 'notes': record.notes,
                 'contacts_count': getattr(record, 'contacts_count', record.contacts.count()),
+                'source_lead_id': record.source_lead_id,
+                'lead_id': record.source_lead_id,
+                'source_lead': source_lead_ref,
+                'lead': source_lead_ref,
             }
         )
     elif object_key == 'contact':
+        source_lead_ref = _serialize_lead_ref(record.source_lead)
         data.update(
             {
                 'name': record.name,
@@ -568,6 +657,10 @@ def serialize_crm_record(
                 'phone': record.phone,
                 'sms_consent': bool(record.sms_consent),
                 'notes': record.notes,
+                'source_lead_id': record.source_lead_id,
+                'lead_id': record.source_lead_id,
+                'source_lead': source_lead_ref,
+                'lead': source_lead_ref,
             }
         )
     elif object_key == 'lead':
@@ -579,10 +672,20 @@ def serialize_crm_record(
                 'phone': record.phone,
                 'sms_consent': bool(record.sms_consent),
                 'status': record.status,
+                'converted': record.status == Lead.STATUS_CONVERTED,
+                'converted_at': record.converted_at.isoformat() if record.converted_at else None,
+                'converted_by': _serialize_user_ref(record.converted_by),
+                'converted_account_id': record.converted_account_id,
+                'converted_contact_id': record.converted_contact_id,
+                'converted_deal_id': record.converted_deal_id,
+                'converted_account': _serialize_account_ref(record.converted_account),
+                'converted_contact': _serialize_contact_ref(record.converted_contact),
+                'converted_deal': _serialize_deal_ref(record.converted_deal),
                 'notes': record.notes,
             }
         )
     elif object_key == 'deal':
+        source_lead_ref = _serialize_lead_ref(record.source_lead)
         data.update(
             {
                 'title': record.title,
@@ -602,6 +705,10 @@ def serialize_crm_record(
                     else None
                 ),
                 'notes': record.notes,
+                'source_lead_id': record.source_lead_id,
+                'lead_id': record.source_lead_id,
+                'source_lead': source_lead_ref,
+                'lead': source_lead_ref,
             }
         )
     elif object_key == 'job':
@@ -703,10 +810,26 @@ def serialize_crm_record(
     return data
 
 
+def _attach_source_leads(linked: dict, record, *, user, workspace) -> None:
+    if not _is_enabled_and_readable(user, workspace, 'lead'):
+        return
+    leads_by_id: dict[int, Lead] = {}
+    if getattr(record, 'source_lead_id', None) and getattr(record, 'source_lead', None):
+        leads_by_id[record.source_lead_id] = record.source_lead
+    if hasattr(record, 'source_leads'):
+        for row in record.source_leads.filter(workspace=workspace).order_by('-converted_at', '-id')[:25]:
+            leads_by_id.setdefault(row.id, row)
+    if leads_by_id:
+        serialized = [_serialize_lead_ref(row) for row in leads_by_id.values()]
+        linked['lead'] = serialized[0]
+        linked['source_leads'] = serialized
+
+
 def _serialize_linked_records(record, object_key: str, *, user, workspace) -> dict:
     linked: dict = {}
 
     if object_key == 'account':
+        _attach_source_leads(linked, record, user=user, workspace=workspace)
         if _is_enabled_and_readable(user, workspace, 'contact'):
             linked['contacts'] = [
                 {
@@ -749,6 +872,7 @@ def _serialize_linked_records(record, object_key: str, *, user, workspace) -> di
             ]
 
     elif object_key == 'contact':
+        _attach_source_leads(linked, record, user=user, workspace=workspace)
         if record.account_id and _is_enabled_and_readable(user, workspace, 'account'):
             linked['account'] = _serialize_account_ref(record.account)
         if _is_enabled_and_readable(user, workspace, 'deal'):
@@ -792,7 +916,19 @@ def _serialize_linked_records(record, object_key: str, *, user, workspace) -> di
                 for t in record.tickets.filter(workspace=workspace).order_by('-updated_at', '-id')[:50]
             ]
 
+    elif object_key == 'lead':
+        if record.converted_account_id and _is_enabled_and_readable(user, workspace, 'account'):
+            linked['account'] = _serialize_account_ref(record.converted_account)
+        if record.converted_contact_id and _is_enabled_and_readable(user, workspace, 'contact'):
+            linked['contact'] = _serialize_contact_ref(record.converted_contact)
+        if record.converted_deal_id and _is_enabled_and_readable(user, workspace, 'deal'):
+            deal_ref = _serialize_deal_ref(record.converted_deal)
+            linked['deal'] = deal_ref
+            linked['deals'] = [deal_ref]
+
     elif object_key in ('deal', 'job', 'ticket'):
+        if object_key == 'deal':
+            _attach_source_leads(linked, record, user=user, workspace=workspace)
         if record.account_id and _is_enabled_and_readable(user, workspace, 'account'):
             linked['account'] = _serialize_account_ref(record.account)
         if record.contact_id and _is_enabled_and_readable(user, workspace, 'contact'):
@@ -809,11 +945,18 @@ def _build_base_queryset(workspace, object_key: str):
     model_cls = CRM_MODELS_BY_KEY[object_key]
     qs = model_cls.objects.filter(workspace=workspace).select_related('owner', 'created_by')
     if object_key == 'account':
-        qs = qs.annotate(contacts_count=Count('contacts', distinct=True))
+        qs = qs.select_related('source_lead').annotate(contacts_count=Count('contacts', distinct=True))
     elif object_key == 'contact':
-        qs = qs.select_related('account')
+        qs = qs.select_related('account', 'source_lead')
+    elif object_key == 'lead':
+        qs = qs.select_related(
+            'converted_by',
+            'converted_account',
+            'converted_contact',
+            'converted_deal',
+        )
     elif object_key == 'deal':
-        qs = qs.select_related('account', 'contact')
+        qs = qs.select_related('account', 'contact', 'source_lead')
     elif object_key == 'job':
         qs = qs.select_related('account', 'contact', 'assignee')
     elif object_key == 'appointment':
@@ -978,6 +1121,17 @@ def list_crm_records(
     offset = (page - 1) * page_size
     rows = list(qs[offset : offset + page_size])
 
+    permissions_payload = {
+        'can_create': user_has_object_right(user, workspace, object_key, 'create'),
+        'can_read': True,
+        'can_update': user_has_object_right(user, workspace, object_key, 'update'),
+        'can_delete': user_has_object_right(user, workspace, object_key, 'delete'),
+    }
+    if object_key in ('lead', 'deal'):
+        cap = get_lead_conversion_capability(user, workspace)
+        permissions_payload['conversion_available'] = cap['conversion_available']
+        permissions_payload['can_convert_lead'] = cap['can_convert_lead']
+
     return {
         'results': [
             serialize_crm_record(row, object_key, workspace=workspace)
@@ -990,12 +1144,7 @@ def list_crm_records(
         'has_next': page < total_pages,
         'has_previous': page > 1,
         'summary': summary,
-        'permissions': {
-            'can_create': user_has_object_right(user, workspace, object_key, 'create'),
-            'can_read': True,
-            'can_update': user_has_object_right(user, workspace, object_key, 'update'),
-            'can_delete': user_has_object_right(user, workspace, object_key, 'delete'),
-        },
+        'permissions': permissions_payload,
     }
 
 
@@ -1062,6 +1211,23 @@ def get_crm_record_detail(workspace, user, object_key: str, record_id: int) -> d
     record = _build_base_queryset(workspace, object_key).filter(id=record_id).first()
     if record is None:
         raise CrmDomainError(f'{OBJECTS_BY_KEY[object_key].label} not found.', status_code=404)
+    permissions_payload = {
+        'can_create': user_has_object_right(user, workspace, object_key, 'create'),
+        'can_read': True,
+        'can_update': user_has_object_right(user, workspace, object_key, 'update'),
+        'can_delete': user_has_object_right(user, workspace, object_key, 'delete'),
+        'activity': {
+            'can_create': user_has_object_right(user, workspace, 'activity', 'create'),
+            'can_read': user_has_object_right(user, workspace, 'activity', 'read'),
+            'can_update': user_has_object_right(user, workspace, 'activity', 'update'),
+            'can_delete': user_has_object_right(user, workspace, 'activity', 'delete'),
+        },
+    }
+    if object_key in ('lead', 'deal'):
+        cap = get_lead_conversion_capability(user, workspace)
+        permissions_payload['conversion_available'] = cap['conversion_available']
+        permissions_payload['can_convert_lead'] = cap['can_convert_lead']
+
     return {
         'record': serialize_crm_record(
             record,
@@ -1070,18 +1236,7 @@ def get_crm_record_detail(workspace, user, object_key: str, record_id: int) -> d
             user=user,
             workspace=workspace,
         ),
-        'permissions': {
-            'can_create': user_has_object_right(user, workspace, object_key, 'create'),
-            'can_read': True,
-            'can_update': user_has_object_right(user, workspace, object_key, 'update'),
-            'can_delete': user_has_object_right(user, workspace, object_key, 'delete'),
-            'activity': {
-                'can_create': user_has_object_right(user, workspace, 'activity', 'create'),
-                'can_read': user_has_object_right(user, workspace, 'activity', 'read'),
-                'can_update': user_has_object_right(user, workspace, 'activity', 'update'),
-                'can_delete': user_has_object_right(user, workspace, 'activity', 'delete'),
-            },
-        },
+        'permissions': permissions_payload,
     }
 
 
@@ -1520,34 +1675,45 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                 _apply_field_update(record, 'account', next_account, changes)
 
         elif object_key == 'lead':
+            is_converted = record.status == Lead.STATUS_CONVERTED
+            next_name = (
+                _parse_required_str(payload, 'name', label='Lead name', max_length=255)
+                if 'name' in payload
+                else record.name
+            )
+            next_company = (
+                _parse_optional_str(payload, 'company', label='Company', max_length=255)
+                if 'company' in payload
+                else record.company
+            )
+            next_phone = (
+                _parse_optional_str(payload, 'phone', label='Phone', max_length=64)
+                if 'phone' in payload
+                else record.phone
+            )
+            next_email = (
+                _parse_optional_email(payload, 'email')
+                if 'email' in payload
+                else record.email
+            )
+            if is_converted and (
+                next_name != record.name
+                or next_company != record.company
+                or next_phone != record.phone
+                or next_email != record.email
+            ):
+                raise CrmDomainError(
+                    'Name, company, email, and phone stay with the Account and Contact created from this converted lead.',
+                    status_code=400,
+                )
             if 'name' in payload:
-                _apply_field_update(
-                    record,
-                    'name',
-                    _parse_required_str(payload, 'name', label='Lead name', max_length=255),
-                    changes,
-                )
+                _apply_field_update(record, 'name', next_name, changes)
             if 'company' in payload:
-                _apply_field_update(
-                    record,
-                    'company',
-                    _parse_optional_str(payload, 'company', label='Company', max_length=255),
-                    changes,
-                )
+                _apply_field_update(record, 'company', next_company, changes)
             if 'phone' in payload:
-                _apply_field_update(
-                    record,
-                    'phone',
-                    _parse_optional_str(payload, 'phone', label='Phone', max_length=64),
-                    changes,
-                )
+                _apply_field_update(record, 'phone', next_phone, changes)
             if 'email' in payload:
-                _apply_field_update(
-                    record,
-                    'email',
-                    _parse_optional_email(payload, 'email'),
-                    changes,
-                )
+                _apply_field_update(record, 'email', next_email, changes)
             if 'sms_consent' in payload:
                 _apply_field_update(
                     record,
@@ -1968,6 +2134,12 @@ def delete_crm_record(workspace, user, object_key: str, record_id: int) -> dict:
                     f'Cannot delete this {contact_label} because one or more Jobs link only to it.',
                     status_code=409,
                 )
+        elif object_key == 'lead':
+            if record.status == Lead.STATUS_CONVERTED or record.converted_at is not None:
+                raise CrmDomainError(
+                    'Cannot delete a converted lead. Converted leads remain on record.',
+                    status_code=409,
+                )
 
         record_label = get_record_label(record, object_key)
         deleted_id = record.id
@@ -2043,6 +2215,7 @@ def get_crm_options(workspace, user) -> dict:
             for con in con_qs[:250]
         ]
 
+    conversion_cap = get_lead_conversion_capability(user, workspace)
     return {
         'assignees': assignees,
         'accounts': accounts,
@@ -2051,6 +2224,8 @@ def get_crm_options(workspace, user) -> dict:
         'contacts': contacts,
         'contacts_total_count': contacts_total_count,
         'contacts_truncated': contacts_total_count > len(contacts),
+        'lead_conversion_available': conversion_cap['conversion_available'],
+        'can_convert_lead': conversion_cap['can_convert_lead'],
         'constants': {
             'deal_stages': list(Deal.DEFAULT_STAGES),
             'job_statuses': list(Job.DEFAULT_STATUSES),
@@ -2149,7 +2324,10 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
             elif obj_key == 'contact':
                 meta = row.title or row.email or _get_contact_screen_label(workspace)
             elif obj_key == 'lead':
-                meta = row.company or row.status.title()
+                if row.status == Lead.STATUS_CONVERTED:
+                    meta = f'{row.company} · Converted' if row.company else 'Converted'
+                else:
+                    meta = row.company or row.status.title()
             elif obj_key == 'deal':
                 meta = f'{row.stage} · GHS {row.amount:.2f}'
             elif obj_key == 'job':

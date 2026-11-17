@@ -1,0 +1,673 @@
+from decimal import Decimal
+import re
+
+from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
+
+from .audit_service import record_audit_event
+from .crm_service import (
+    RECORD_CODE_PREFIXES,
+    CrmDomainError,
+    _build_base_queryset,
+    _first_present,
+    _get_contact_screen_label,
+    _has_any_key,
+    _is_enabled_and_readable,
+    _parse_decimal,
+    _parse_fk_id,
+    _parse_int_range,
+    _parse_optional_date,
+    _parse_optional_str,
+    _parse_required_str,
+    _validate_choice,
+    ensure_object_permission,
+    ensure_object_table_enabled,
+    get_lead_conversion_capability,
+    get_record_label,
+    serialize_crm_record,
+)
+from ..catalog import OBJECTS_BY_KEY
+from ..models import (
+    Account,
+    Activity,
+    AuditLog,
+    Contact,
+    Deal,
+    Lead,
+    WorkspaceTable,
+)
+
+MAX_MATCH_RESULTS = 15
+_PHONE_PUNCTUATION_RE = re.compile(r'[\s\-\(\)\.]+')
+
+
+def _normalize_text(value: str | None) -> str:
+    return ' '.join((value or '').strip().lower().split())
+
+
+def _normalize_phone(value: str | None) -> str:
+    return _PHONE_PUNCTUATION_RE.sub('', (value or '').strip()).lower()
+
+
+def _ensure_conversion_tables_enabled(workspace) -> None:
+    """Require Lead, Deal, Account, and Contact tables to be enabled for conversion."""
+    ensure_object_table_enabled(workspace, 'lead')
+    if not WorkspaceTable.objects.filter(
+        workspace=workspace,
+        object_key='deal',
+        is_enabled=True,
+    ).exists():
+        raise CrmDomainError(
+            'Lead-to-deal conversion is not available in this workspace because the Deal table is not enabled.',
+            status_code=404,
+        )
+    ensure_object_table_enabled(workspace, 'account')
+    ensure_object_table_enabled(workspace, 'contact')
+
+
+def _find_account_matches(workspace, user, lead: Lead) -> list[dict]:
+    if not _is_enabled_and_readable(user, workspace, 'account'):
+        return []
+
+    company_norm = _normalize_text(lead.company)
+    email_norm = _normalize_text(lead.email)
+    phone_norm = _normalize_phone(lead.phone)
+    if not company_norm and not email_norm and not phone_norm:
+        return []
+
+    query = Q()
+    if company_norm:
+        query |= Q(name__iexact=lead.company.strip())
+    if email_norm:
+        query |= Q(email__iexact=email_norm)
+
+    phone_ids: list[int] = []
+    if phone_norm:
+        for acc_id, acc_phone in Account.objects.filter(workspace=workspace).exclude(phone='').values_list('id', 'phone'):
+            if _normalize_phone(acc_phone) == phone_norm:
+                phone_ids.append(acc_id)
+        if phone_ids:
+            query |= Q(id__in=phone_ids)
+
+    if not query:
+        return []
+
+    matches: list[dict] = []
+    for account in Account.objects.filter(workspace=workspace).filter(query).order_by('-updated_at', 'id'):
+        reasons: list[str] = []
+        if company_norm and _normalize_text(account.name) == company_norm:
+            reasons.append('Company name')
+        if email_norm and _normalize_text(account.email) == email_norm:
+            reasons.append('Email')
+        if phone_norm and _normalize_phone(account.phone) == phone_norm:
+            reasons.append('Phone')
+        if not reasons:
+            continue
+        matches.append(
+            {
+                'id': account.id,
+                'record_code': f'{RECORD_CODE_PREFIXES["account"]}-{account.id}',
+                'name': account.name,
+                'city': account.city,
+                'email': account.email,
+                'phone': account.phone,
+                'match_reasons': reasons,
+            }
+        )
+
+    matches.sort(key=lambda item: (-len(item['match_reasons']), item['name'].lower(), item['id']))
+    return matches[:MAX_MATCH_RESULTS]
+
+
+def _find_contact_matches(workspace, user, lead: Lead) -> list[dict]:
+    if not _is_enabled_and_readable(user, workspace, 'contact'):
+        return []
+
+    name_norm = _normalize_text(lead.name)
+    email_norm = _normalize_text(lead.email)
+    phone_norm = _normalize_phone(lead.phone)
+    if not name_norm and not email_norm and not phone_norm:
+        return []
+
+    query = Q()
+    if email_norm:
+        query |= Q(email__iexact=email_norm)
+    if name_norm:
+        query |= Q(name__iexact=lead.name.strip())
+
+    phone_ids: list[int] = []
+    if phone_norm:
+        for con_id, con_phone in Contact.objects.filter(workspace=workspace).exclude(phone='').values_list('id', 'phone'):
+            if _normalize_phone(con_phone) == phone_norm:
+                phone_ids.append(con_id)
+        if phone_ids:
+            query |= Q(id__in=phone_ids)
+
+    if not query:
+        return []
+
+    matches: list[dict] = []
+    contacts = (
+        Contact.objects.select_related('account')
+        .filter(workspace=workspace)
+        .filter(query)
+        .order_by('-updated_at', 'id')
+    )
+    for contact in contacts:
+        reasons: list[str] = []
+        if email_norm and _normalize_text(contact.email) == email_norm:
+            reasons.append('Email')
+        if phone_norm and _normalize_phone(contact.phone) == phone_norm:
+            reasons.append('Phone')
+        if name_norm and _normalize_text(contact.name) == name_norm:
+            reasons.append('Name')
+        if not reasons:
+            continue
+        matches.append(
+            {
+                'id': contact.id,
+                'record_code': f'{RECORD_CODE_PREFIXES["contact"]}-{contact.id}',
+                'name': contact.name,
+                'title': contact.title,
+                'email': contact.email,
+                'phone': contact.phone,
+                'account_id': contact.account_id,
+                'account_name': contact.account.name if contact.account else '',
+                'match_reasons': reasons,
+            }
+        )
+
+    matches.sort(
+        key=lambda item: (
+            -len(item['match_reasons']),
+            0 if ('Email' in item['match_reasons'] or 'Phone' in item['match_reasons']) else 1,
+            item['name'].lower(),
+            item['id'],
+        )
+    )
+    return matches[:MAX_MATCH_RESULTS]
+
+
+def get_lead_conversion_preview(workspace, user, lead_id: int) -> dict:
+    """Return matching existing Accounts/Contacts, defaults, and permissions for converting a Lead."""
+    _ensure_conversion_tables_enabled(workspace)
+    ensure_object_permission(user, workspace, 'lead', 'read')
+
+    lead = _build_base_queryset(workspace, 'lead').filter(id=lead_id).first()
+    if lead is None:
+        raise CrmDomainError(f'{OBJECTS_BY_KEY["lead"].label} not found.', status_code=404)
+
+    default_account_name = (lead.company or '').strip() or lead.name
+    capability = get_lead_conversion_capability(user, workspace)
+
+    return {
+        'lead': serialize_crm_record(lead, 'lead', workspace=workspace),
+        'already_converted': lead.status == Lead.STATUS_CONVERTED or lead.converted_at is not None,
+        'account_matches': _find_account_matches(workspace, user, lead),
+        'contact_matches': _find_contact_matches(workspace, user, lead),
+        'defaults': {
+            'account_name': default_account_name,
+            'account_city': '',
+            'contact_name': lead.name,
+            'contact_title': '',
+            'deal_title': f'{default_account_name} Deal',
+            'deal_stage': 'Qualified',
+            'deal_amount': '0.00',
+            'target_close_date': None,
+            'win_probability': None,
+        },
+        'capabilities': capability,
+    }
+
+
+def _parse_optional_override_name(payload: dict, *keys: str, fallback: str, label: str) -> str:
+    if _has_any_key(payload, *keys):
+        raw = _first_present(payload, *keys)
+        if raw is not None:
+            return _parse_required_str(payload, *keys, label=label, max_length=255)
+    return fallback
+
+
+def _resolve_conversion_account(
+    workspace,
+    user,
+    lead: Lead,
+    payload: dict,
+) -> tuple[Account, bool]:
+    raw_account_id = _first_present(payload, 'account_id', 'account')
+    account_id = _parse_fk_id(raw_account_id, field_name='Account')
+    if account_id is not None:
+        ensure_object_permission(user, workspace, 'account', 'read')
+        account = Account.objects.filter(workspace=workspace, id=account_id).first()
+        if account is None:
+            raise CrmDomainError('Selected Account was not found in this workspace.', status_code=400)
+        return account, False
+
+    ensure_object_permission(user, workspace, 'account', 'create')
+    fallback_name = (lead.company or '').strip() or lead.name
+    account_name = _parse_optional_override_name(
+        payload,
+        'account_name',
+        'company',
+        fallback=fallback_name,
+        label='Account name',
+    )
+    account_city = _parse_optional_str(
+        payload,
+        'account_city',
+        'city',
+        label='City',
+        max_length=120,
+    )
+    account = Account.objects.create(
+        workspace=workspace,
+        owner=lead.owner or user,
+        created_by=user,
+        visibility=lead.visibility,
+        shared_role=lead.shared_role,
+        name=account_name,
+        city=account_city,
+        phone=lead.phone,
+        email=lead.email,
+        notes=lead.notes,
+        source_lead=lead,
+    )
+    return account, True
+
+
+def _resolve_conversion_contact(
+    workspace,
+    user,
+    lead: Lead,
+    account: Account,
+    payload: dict,
+) -> tuple[Contact, bool, bool]:
+    contact_label = _get_contact_screen_label(workspace)
+    raw_contact_id = _first_present(payload, 'contact_id', 'contact')
+    contact_id = _parse_fk_id(raw_contact_id, field_name=contact_label)
+
+    if contact_id is not None:
+        ensure_object_permission(user, workspace, 'contact', 'read')
+        contact = (
+            Contact.objects.select_related('account')
+            .filter(workspace=workspace, id=contact_id)
+            .first()
+        )
+        if contact is None:
+            raise CrmDomainError(
+                f'Selected {contact_label} was not found in this workspace.',
+                status_code=400,
+            )
+        if contact.account_id is not None and contact.account_id != account.id:
+            raise CrmDomainError(
+                f'Selected {contact_label} belongs to {contact.account.name}, not {account.name}.',
+                status_code=400,
+            )
+        linked_existing_contact = False
+        if contact.account_id is None:
+            ensure_object_permission(user, workspace, 'contact', 'update')
+            contact.account = account
+            contact.save(update_fields=['account', 'updated_at'])
+            linked_existing_contact = True
+        return contact, False, linked_existing_contact
+
+    ensure_object_permission(user, workspace, 'contact', 'create')
+    contact_name = _parse_optional_override_name(
+        payload,
+        'contact_name',
+        fallback=lead.name,
+        label=f'{contact_label} name',
+    )
+    contact_title = _parse_optional_str(
+        payload,
+        'contact_title',
+        'title',
+        label='Title',
+        max_length=150,
+    )
+    contact = Contact.objects.create(
+        workspace=workspace,
+        owner=lead.owner or user,
+        created_by=user,
+        visibility=lead.visibility,
+        shared_role=lead.shared_role,
+        account=account,
+        name=contact_name,
+        title=contact_title,
+        email=lead.email,
+        phone=lead.phone,
+        sms_consent=bool(lead.sms_consent),
+        notes=lead.notes,
+        source_lead=lead,
+    )
+    return contact, True, False
+
+
+def _record_conversion_notes(
+    workspace,
+    user,
+    *,
+    lead: Lead,
+    account: Account,
+    account_created: bool,
+    contact: Contact,
+    contact_created: bool,
+    deal: Deal,
+) -> None:
+    if not WorkspaceTable.objects.filter(
+        workspace=workspace,
+        object_key='activity',
+        is_enabled=True,
+    ).exists():
+        return
+
+    lead_code = f'{RECORD_CODE_PREFIXES["lead"]}-{lead.id}'
+    acc_code = f'{RECORD_CODE_PREFIXES["account"]}-{account.id}'
+    con_code = f'{RECORD_CODE_PREFIXES["contact"]}-{contact.id}'
+    deal_code = f'{RECORD_CODE_PREFIXES["deal"]}-{deal.id}'
+
+    notes = [
+        (
+            'lead',
+            lead.id,
+            f'Converted into {acc_code} ({account.name}), {con_code} ({contact.name}), and {deal_code} ({deal.title}).',
+        ),
+        (
+            'account',
+            account.id,
+            (
+                f'Created from {lead_code} ({lead.name}) alongside {con_code} and {deal_code}.'
+                if account_created
+                else f'Linked from converted lead {lead_code} ({lead.name}) alongside {con_code} and {deal_code}.'
+            ),
+        ),
+        (
+            'contact',
+            contact.id,
+            (
+                f'Converted from {lead_code} ({lead.name}) with {acc_code} and {deal_code}.'
+                if contact_created
+                else f'Linked from converted lead {lead_code} ({lead.name}) with {acc_code} and {deal_code}.'
+            ),
+        ),
+        (
+            'deal',
+            deal.id,
+            f'Converted from {lead_code} ({lead.name}) for {acc_code} and {con_code}.',
+        ),
+    ]
+    for target_type, target_id, summary in notes:
+        Activity.objects.create(
+            workspace=workspace,
+            owner=user,
+            created_by=user,
+            activity_type=Activity.TYPE_NOTE,
+            target_object_type=target_type,
+            target_object_id=target_id,
+            summary=summary,
+        )
+
+
+def _record_conversion_audits(
+    workspace,
+    user,
+    *,
+    lead: Lead,
+    previous_status: str,
+    account: Account,
+    account_created: bool,
+    contact: Contact,
+    contact_created: bool,
+    linked_existing_contact: bool,
+    deal: Deal,
+) -> None:
+    if account_created:
+        record_audit_event(
+            workspace=workspace,
+            object_type='account',
+            object_id=account.id,
+            record_label=get_record_label(account, 'account'),
+            action=AuditLog.ACTION_CREATE,
+            field_name='record',
+            previous_value=None,
+            new_value=account.name,
+            actor_kind=AuditLog.ACTOR_KIND_PERSON,
+            actor_user=user,
+        )
+    if contact_created:
+        record_audit_event(
+            workspace=workspace,
+            object_type='contact',
+            object_id=contact.id,
+            record_label=get_record_label(contact, 'contact'),
+            action=AuditLog.ACTION_CREATE,
+            field_name='record',
+            previous_value=None,
+            new_value=contact.name,
+            actor_kind=AuditLog.ACTOR_KIND_PERSON,
+            actor_user=user,
+        )
+    elif linked_existing_contact:
+        record_audit_event(
+            workspace=workspace,
+            object_type='contact',
+            object_id=contact.id,
+            record_label=get_record_label(contact, 'contact'),
+            action=AuditLog.ACTION_UPDATE,
+            field_name='account',
+            previous_value=None,
+            new_value=account.name,
+            actor_kind=AuditLog.ACTOR_KIND_PERSON,
+            actor_user=user,
+        )
+
+    record_audit_event(
+        workspace=workspace,
+        object_type='deal',
+        object_id=deal.id,
+        record_label=get_record_label(deal, 'deal'),
+        action=AuditLog.ACTION_CREATE,
+        field_name='record',
+        previous_value=None,
+        new_value=deal.title,
+        actor_kind=AuditLog.ACTOR_KIND_PERSON,
+        actor_user=user,
+    )
+
+    lead_label = get_record_label(lead, 'lead')
+    record_audit_event(
+        workspace=workspace,
+        object_type='lead',
+        object_id=lead.id,
+        record_label=lead_label,
+        action=AuditLog.ACTION_UPDATE,
+        field_name='status',
+        previous_value=previous_status,
+        new_value=Lead.STATUS_CONVERTED,
+        actor_kind=AuditLog.ACTOR_KIND_PERSON,
+        actor_user=user,
+    )
+    record_audit_event(
+        workspace=workspace,
+        object_type='lead',
+        object_id=lead.id,
+        record_label=lead_label,
+        action=AuditLog.ACTION_UPDATE,
+        field_name='converted_deal',
+        previous_value=None,
+        new_value=f'{RECORD_CODE_PREFIXES["deal"]}-{deal.id} ({deal.title})',
+        actor_kind=AuditLog.ACTOR_KIND_PERSON,
+        actor_user=user,
+    )
+
+
+def convert_lead_record(
+    workspace,
+    user,
+    lead_id: int,
+    payload: dict | None = None,
+) -> dict:
+    """Convert an open Lead into an Account, Contact, and Deal inside one atomic transaction."""
+    _ensure_conversion_tables_enabled(workspace)
+    ensure_object_permission(user, workspace, 'lead', 'update')
+    ensure_object_permission(user, workspace, 'deal', 'create')
+
+    data = payload if isinstance(payload, dict) else {}
+
+    with transaction.atomic():
+        lead = (
+            Lead.objects.select_for_update(of=('self',))
+            .filter(workspace=workspace, id=lead_id)
+            .first()
+        )
+        if lead is None:
+            raise CrmDomainError(f'{OBJECTS_BY_KEY["lead"].label} not found.', status_code=404)
+
+        if lead.status == Lead.STATUS_CONVERTED or lead.converted_at is not None:
+            raise CrmDomainError(
+                f'Lead {lead.name} has already been converted and cannot be converted again.',
+                status_code=409,
+            )
+
+        account, account_created = _resolve_conversion_account(workspace, user, lead, data)
+        contact, contact_created, linked_existing_contact = _resolve_conversion_contact(
+            workspace,
+            user,
+            lead,
+            account,
+            data,
+        )
+
+        deal_title = _parse_optional_override_name(
+            data,
+            'deal_title',
+            'title',
+            fallback=f'{account.name} Deal',
+            label='Deal title',
+        )
+        deal_stage = _validate_choice(
+            _first_present(data, 'deal_stage', 'stage', default='Qualified'),
+            Deal.DEFAULT_STAGES,
+            field_name='Stage',
+        )
+        deal_amount = _parse_decimal(
+            _first_present(data, 'deal_amount', 'amount'),
+            field_name='Amount',
+            allow_null=False,
+            default=Decimal('0.00'),
+        )
+        target_close_date = _parse_optional_date(
+            data.get('target_close_date'),
+            field_name='Target close date',
+        )
+        win_probability = _parse_int_range(
+            data.get('win_probability'),
+            field_name='Win probability',
+            min_val=0,
+            max_val=100,
+            allow_null=True,
+        )
+
+        deal = Deal.objects.create(
+            workspace=workspace,
+            owner=lead.owner or user,
+            created_by=user,
+            visibility=lead.visibility,
+            shared_role=lead.shared_role,
+            title=deal_title,
+            account=account,
+            contact=contact,
+            amount=deal_amount,
+            stage=deal_stage,
+            target_close_date=target_close_date,
+            win_probability=win_probability,
+            notes=lead.notes,
+            source_lead=lead,
+        )
+
+        previous_status = lead.status
+        lead.status = Lead.STATUS_CONVERTED
+        lead.converted_at = timezone.now()
+        lead.converted_by = user
+        lead.converted_account = account
+        lead.converted_contact = contact
+        lead.converted_deal = deal
+        lead.save(
+            update_fields=[
+                'status',
+                'converted_at',
+                'converted_by',
+                'converted_account',
+                'converted_contact',
+                'converted_deal',
+                'updated_at',
+            ]
+        )
+
+        _record_conversion_notes(
+            workspace,
+            user,
+            lead=lead,
+            account=account,
+            account_created=account_created,
+            contact=contact,
+            contact_created=contact_created,
+            deal=deal,
+        )
+        _record_conversion_audits(
+            workspace,
+            user,
+            lead=lead,
+            previous_status=previous_status,
+            account=account,
+            account_created=account_created,
+            contact=contact,
+            contact_created=contact_created,
+            linked_existing_contact=linked_existing_contact,
+            deal=deal,
+        )
+
+    fresh_lead = _build_base_queryset(workspace, 'lead').get(pk=lead.pk)
+    fresh_account = _build_base_queryset(workspace, 'account').get(pk=account.pk)
+    fresh_contact = _build_base_queryset(workspace, 'contact').get(pk=contact.pk)
+    fresh_deal = _build_base_queryset(workspace, 'deal').get(pk=deal.pk)
+
+    return {
+        'lead': serialize_crm_record(
+            fresh_lead,
+            'lead',
+            include_detail=True,
+            user=user,
+            workspace=workspace,
+        ),
+        'account': serialize_crm_record(
+            fresh_account,
+            'account',
+            include_detail=True,
+            user=user,
+            workspace=workspace,
+        ),
+        'contact': serialize_crm_record(
+            fresh_contact,
+            'contact',
+            include_detail=True,
+            user=user,
+            workspace=workspace,
+        ),
+        'deal': serialize_crm_record(
+            fresh_deal,
+            'deal',
+            include_detail=True,
+            user=user,
+            workspace=workspace,
+        ),
+        'created': {
+            'account': account_created,
+            'contact': contact_created,
+            'deal': True,
+        },
+        'message': (
+            f'Converted {lead.name} into {account.name}, {contact.name}, and {deal.title}.'
+        ),
+    }
