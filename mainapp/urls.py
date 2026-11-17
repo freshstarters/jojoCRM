@@ -18,6 +18,8 @@ from .views.auth_views import (
 from .views.crm_views import (
     workspace_crm_options_view,
     workspace_dashboard_view,
+    workspace_lead_conversion_preview_view,
+    workspace_lead_convert_view,
     workspace_record_activities_view,
     workspace_record_collection_view,
     workspace_record_detail_view,
@@ -172,6 +174,26 @@ urlpatterns = [
         'workspaces/<slug:slug>/records/<str:object_key>/<int:record_id>/activities/',
         workspace_record_activities_view,
         name='workspace_record_activities',
+    ),
+    path(
+        'workspaces/<slug:slug>/records/lead/<int:record_id>/conversion-preview/',
+        workspace_lead_conversion_preview_view,
+        name='workspace_lead_conversion_preview',
+    ),
+    path(
+        'workspaces/<slug:slug>/records/leads/<int:record_id>/conversion-preview/',
+        workspace_lead_conversion_preview_view,
+        name='workspace_leads_conversion_preview',
+    ),
+    path(
+        'workspaces/<slug:slug>/records/lead/<int:record_id>/convert/',
+        workspace_lead_convert_view,
+        name='workspace_lead_convert',
+    ),
+    path(
+        'workspaces/<slug:slug>/records/leads/<int:record_id>/convert/',
+        workspace_lead_convert_view,
+        name='workspace_leads_convert',
     ),
     path('workspaces/<slug:slug>/packs/', workspace_packs_view, name='workspace_packs'),
     path(

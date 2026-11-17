@@ -22,6 +22,10 @@ from ..service.crm_service import (
     resolve_object_key,
     update_crm_record,
 )
+from ..service.lead_conversion_service import (
+    convert_lead_record,
+    get_lead_conversion_preview,
+)
 
 
 @require_GET
@@ -167,5 +171,45 @@ def workspace_record_activities_view(request, slug: str, object_key: str, record
         }
         result = create_crm_record(workspace, user, 'activity', merged_payload)
         return JsonResponse(result, status=201)
+    except CrmDomainError as exc:
+        return JsonResponse({'error': exc.message}, status=exc.status_code)
+
+
+@require_GET
+def workspace_lead_conversion_preview_view(request, slug: str, record_id: int):
+    """Return matching existing Accounts/Contacts, defaults, and capabilities for Lead conversion."""
+    user, workspace, error_response = require_workspace_member(request, slug)
+    if error_response is not None:
+        return error_response
+
+    try:
+        result = get_lead_conversion_preview(workspace, user, record_id)
+        return JsonResponse(result, status=200)
+    except CrmDomainError as exc:
+        return JsonResponse({'error': exc.message}, status=exc.status_code)
+
+
+@require_http_methods(['POST'])
+def workspace_lead_convert_view(request, slug: str, record_id: int):
+    """Convert an open Lead into an Account, Contact, and Deal."""
+    user, workspace, error_response = require_workspace_member(request, slug)
+    if error_response is not None:
+        return error_response
+
+    raw_body = (request.body or b'').strip()
+    if not raw_body or (
+        request.content_type == 'multipart/form-data'
+        and not request.POST
+        and not request.FILES
+    ):
+        payload = {}
+    else:
+        payload, parse_error = parse_json_object(request)
+        if parse_error is not None:
+            return parse_error
+
+    try:
+        result = convert_lead_record(workspace, user, record_id, payload)
+        return JsonResponse(result, status=200)
     except CrmDomainError as exc:
         return JsonResponse({'error': exc.message}, status=exc.status_code)
