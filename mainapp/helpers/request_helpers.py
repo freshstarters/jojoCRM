@@ -147,3 +147,18 @@ def require_workspace_member(request, slug: str):
         )
 
     return request.user, workspace, None
+
+
+def parse_positive_int(raw_value, *, default: int, name: str, maximum: int | None = None):
+    """Parse a positive integer query param or return a 400 JsonResponse."""
+    if raw_value is None or raw_value == '':
+        return default, None
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        return None, JsonResponse({'error': f'{name} must be a positive integer.'}, status=400)
+    if parsed < 1:
+        return None, JsonResponse({'error': f'{name} must be at least 1.'}, status=400)
+    if maximum is not None and parsed > maximum:
+        parsed = maximum
+    return parsed, None

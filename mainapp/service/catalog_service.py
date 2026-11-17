@@ -2,6 +2,8 @@ from collections.abc import Callable
 
 from django.apps import apps
 from django.db import transaction
+from django.db.models import Count, IntegerField, OuterRef, Subquery, Value
+from django.db.models.functions import Coalesce
 
 from .audit_service import record_audit_event
 from ..catalog import (
@@ -82,9 +84,49 @@ def get_workspace_table_record_counts(
     workspace,
     object_keys: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, int]:
-    """Return a map of object_key -> stored record count for a workspace."""
-    keys = object_keys if object_keys is not None else tuple(OBJECTS_BY_KEY.keys())
-    return {key: get_table_record_count(workspace, key) for key in keys}
+    """Return a map of object_key -> stored record count for a workspace in one batched query."""
+    keys = tuple(object_keys) if object_keys is not None else tuple(OBJECTS_BY_KEY.keys())
+    counts: dict[str, int] = {key: 0 for key in keys}
+    if workspace is None:
+        return counts
+
+    annotations = {}
+    for key in keys:
+        if key not in OBJECTS_BY_KEY:
+            continue
+        resolver = OBJECT_RECORD_COUNT_RESOLVERS.get(key)
+        if resolver is not None:
+            counts[key] = max(0, int(resolver(workspace)))
+            continue
+        model_name = OBJECT_MODEL_NAMES.get(key)
+        if not model_name:
+            continue
+        try:
+            model_cls = apps.get_model('mainapp', model_name)
+        except LookupError:
+            model_cls = None
+        if model_cls is None:
+            continue
+        subq = (
+            model_cls.objects.filter(workspace_id=OuterRef('pk'))
+            .order_by()
+            .values('workspace_id')
+            .annotate(cnt=Count('pk'))
+            .values('cnt')[:1]
+        )
+        annotations[f'cnt_{key}'] = Coalesce(
+            Subquery(subq, output_field=IntegerField()),
+            Value(0),
+        )
+
+    if annotations:
+        from ..models import Workspace
+
+        row = Workspace.objects.filter(pk=workspace.pk).values(**annotations).first() or {}
+        for ann_key, val in row.items():
+            counts[ann_key[4:]] = max(0, int(val or 0))
+
+    return counts
 
 
 def pluralize_contact_label(label: str) -> str:
