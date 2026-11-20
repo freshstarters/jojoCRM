@@ -15,6 +15,7 @@ from ..models import (
     Lead,
     Role,
     Ticket,
+    Visit,
 )
 from .audit_service import record_audit_event
 
@@ -172,7 +173,7 @@ OBJECT_FIELD_SCHEMAS: dict[str, tuple[FieldSchema, ...]] = {
         FieldSchema('assignee', 'Assignee', ('assignee_id', 'assignee'), ('assignee_id', 'assignee')),
     ),
     'visit': (
-        FieldSchema('date', 'Visit date', ('date', 'visited_at'), ('date',)),
+        FieldSchema('date', 'Visit date', ('date', 'visited_at'), ('date', 'visited_at')),
         FieldSchema('reason', 'Reason', ('reason',), ('reason',)),
         FieldSchema(
             'contact',
@@ -194,6 +195,7 @@ PRIMARY_LABEL_FIELD_BY_OBJECT: dict[str, str] = {
     'deal': 'title',
     'job': 'title',
     'appointment': 'title',
+    'visit': 'reason',
     'ticket': 'title',
     'activity': 'summary',
 }
@@ -205,6 +207,7 @@ _SHARED_RECORD_MODELS = (
     ('deal', Deal),
     ('job', Job),
     ('appointment', Appointment),
+    ('visit', Visit),
     ('ticket', Ticket),
     ('activity', Activity),
 )
@@ -615,7 +618,12 @@ def fallback_role_shared_records_to_owner(workspace, role: Role, *, acting_user)
             record.shared_role = None
             record.save(update_fields=['visibility', 'shared_role', 'updated_at'])
             updated_count += 1
-            label = getattr(record, 'name', None) or getattr(record, 'title', None) or getattr(record, 'summary', '')[:60]
+            label = (
+                getattr(record, 'name', None)
+                or getattr(record, 'title', None)
+                or getattr(record, 'reason', None)
+                or getattr(record, 'summary', '')[:60]
+            )
             record_audit_event(
                 workspace=workspace,
                 object_type=object_key,
@@ -627,6 +635,7 @@ def fallback_role_shared_records_to_owner(workspace, role: Role, *, acting_user)
                 new_value='owner',
                 actor_kind=AuditLog.ACTOR_KIND_PERSON,
                 actor_user=acting_user,
+                record=record,
             )
     return updated_count
 

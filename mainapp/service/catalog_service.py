@@ -42,6 +42,7 @@ OBJECT_MODEL_NAMES: dict[str, str] = {
     'deal': 'Deal',
     'job': 'Job',
     'appointment': 'Appointment',
+    'visit': 'Visit',
     'ticket': 'Ticket',
 }
 

@@ -227,6 +227,9 @@ def _build_deal_stage_audit_rows(
             field_name='stage',
             previous_value=old_stage_name,
             new_value=new_stage_name,
+            record_visibility=deal.visibility or '',
+            record_owner_id=deal.owner_id,
+            record_shared_role_id=deal.shared_role_id,
             created_at=now,
         )
         for deal in deals

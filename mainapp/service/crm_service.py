@@ -25,6 +25,7 @@ from ..models import (
     Role,
     Ticket,
     User,
+    Visit,
     WorkspaceRecordBase,
     WorkspaceTable,
 )
@@ -72,6 +73,8 @@ OBJECT_KEY_ALIASES: dict[str, str] = {
     'jobs': 'job',
     'appointment': 'appointment',
     'appointments': 'appointment',
+    'visit': 'visit',
+    'visits': 'visit',
     'ticket': 'ticket',
     'tickets': 'ticket',
 }
@@ -84,6 +87,7 @@ RECORD_CODE_PREFIXES: dict[str, str] = {
     'activity': 'ACT',
     'job': 'JOB',
     'appointment': 'APT',
+    'visit': 'VIS',
     'ticket': 'TCK',
 }
 
@@ -95,6 +99,7 @@ CRM_MODELS_BY_KEY = {
     'activity': Activity,
     'job': Job,
     'appointment': Appointment,
+    'visit': Visit,
     'ticket': Ticket,
 }
 
@@ -342,9 +347,38 @@ REQUIRED_CREATE_FIELDS_BY_OBJECT: dict[str, tuple[str, ...]] = {
     'deal': ('title',),
     'job': ('title',),
     'appointment': ('contact', 'scheduled_at'),
+    'visit': ('contact', 'date', 'reason'),
     'ticket': ('title',),
     'activity': ('activity_type', 'summary'),
 }
+
+FORBIDDEN_VISIT_CLINICAL_KEYS: frozenset[str] = frozenset(
+    {
+        'diagnosis',
+        'diagnosis_code',
+        'icd_code',
+        'chart',
+        'medical_chart',
+        'lab',
+        'labs',
+        'lab_result',
+        'lab_results',
+        'prescription',
+        'prescriptions',
+        'medication',
+        'medications',
+    }
+)
+
+
+def _reject_forbidden_visit_fields(payload: dict) -> None:
+    """Explicitly refuse clinical/EHR keys on Visit payloads (S2.6 guardrail)."""
+    for key in payload.keys():
+        if isinstance(key, str) and key.strip().lower() in FORBIDDEN_VISIT_CLINICAL_KEYS:
+            raise CrmDomainError(
+                'Visits do not store diagnosis codes, charts, lab results, or prescriptions.',
+                status_code=400,
+            )
 
 
 def _ensure_writable_fields(
@@ -565,6 +599,8 @@ def get_record_label(record, object_key: str) -> str:
         return record.name
     if object_key in ('deal', 'job', 'appointment', 'ticket'):
         return record.title
+    if object_key == 'visit':
+        return record.reason
     if object_key == 'activity':
         snippet = (record.summary or '').strip()
         if len(snippet) > 60:
@@ -1032,6 +1068,22 @@ def serialize_crm_record(
                 'notes': record.notes,
             }
         )
+    elif object_key == 'visit':
+        iso_date = record.date.isoformat()
+        contact_ref = _serialize_contact_ref(record.contact, user=user, workspace=ws)
+        data.update(
+            {
+                'date': iso_date,
+                'visited_at': iso_date,
+                'reason': record.reason,
+                'notes': record.notes,
+                'follow_up': record.follow_up,
+                'assignee_id': record.assignee_id,
+                'assignee': _serialize_user_ref(record.assignee),
+                'contact_id': contact_ref['id'] if contact_ref else None,
+                'contact': contact_ref,
+            }
+        )
     elif object_key == 'ticket':
         account_ref = _serialize_account_ref(record.account, user=user, workspace=ws)
         contact_ref = _serialize_contact_ref(record.contact, user=user, workspace=ws)
@@ -1175,6 +1227,14 @@ def _serialize_linked_records(record, object_key: str, *, user, workspace) -> di
             item['scheduled_at'] = a.scheduled_at.isoformat()
         return item
 
+    def _linked_visit_item(v: Visit) -> dict:
+        item = {'id': v.id, 'reason': _get_visible_record_label(v, 'visit', user=user, workspace=workspace)}
+        if get_field_right(user, workspace, 'visit', 'date') != FIELD_RIGHT_HIDDEN:
+            item['date'] = v.date.isoformat()
+        if get_field_right(user, workspace, 'visit', 'follow_up') != FIELD_RIGHT_HIDDEN:
+            item['follow_up'] = v.follow_up
+        return item
+
     if object_key == 'account':
         _attach_source_leads(linked, record, user=user, workspace=workspace)
         if _is_enabled_and_readable(user, workspace, 'contact'):
@@ -1219,6 +1279,11 @@ def _serialize_linked_records(record, object_key: str, *, user, workspace) -> di
                 _linked_appointment_item(a)
                 for a in record.appointments.filter(workspace=workspace).filter(vis_q).order_by('scheduled_at', '-id')[:50]
             ]
+        if _is_enabled_and_readable(user, workspace, 'visit'):
+            linked['visits'] = [
+                _linked_visit_item(v)
+                for v in record.visits.filter(workspace=workspace).filter(vis_q).order_by('-date', '-id')[:50]
+            ]
         if _is_enabled_and_readable(user, workspace, 'ticket'):
             linked['tickets'] = [
                 _linked_ticket_item(t)
@@ -1252,7 +1317,7 @@ def _serialize_linked_records(record, object_key: str, *, user, workspace) -> di
             if con_ref is not None:
                 linked['contact'] = con_ref
 
-    elif object_key == 'appointment':
+    elif object_key in ('appointment', 'visit'):
         if record.contact_id and _is_enabled_and_readable(user, workspace, 'contact'):
             con_ref = _serialize_contact_ref(record.contact, user=user, workspace=workspace)
             if con_ref is not None:
@@ -1383,6 +1448,8 @@ def _build_base_queryset(workspace, object_key: str, *, user=None):
         qs = qs.select_related('account', 'contact', 'assignee')
     elif object_key == 'appointment':
         qs = qs.select_related('contact', 'assignee')
+    elif object_key == 'visit':
+        qs = qs.select_related('contact', 'assignee')
     elif object_key == 'ticket':
         qs = qs.select_related('account', 'contact', 'assignee')
     elif object_key == 'activity':
@@ -1431,6 +1498,10 @@ def list_crm_records(
         if raw_acc and _is_field_visible(user, workspace, 'contact', 'account'):
             acc_id = _parse_fk_id(raw_acc, field_name='Account')
             qs = qs.filter(account_id=acc_id)
+        raw_compat_acc = query_params.get('compatible_account_id')
+        if raw_compat_acc and _is_field_visible(user, workspace, 'contact', 'account'):
+            compat_acc_id = _parse_fk_id(raw_compat_acc, field_name='Account')
+            qs = qs.filter(Q(account_id=compat_acc_id) | Q(account_id__isnull=True))
         raw_consent = (query_params.get('sms_consent') or '').strip().lower()
         if _is_field_visible(user, workspace, 'contact', 'sms_consent'):
             if raw_consent in ('on', 'true', '1'):
@@ -1491,6 +1562,31 @@ def list_crm_records(
             qs = qs.filter(assignee_id=_parse_fk_id(query_params.get('assignee_id'), field_name='Assignee'))
         if query_params.get('contact_id') and _is_field_visible(user, workspace, 'appointment', 'contact'):
             qs = qs.filter(contact_id=_parse_fk_id(query_params.get('contact_id'), field_name='Contact'))
+
+    elif object_key == 'visit':
+        if q:
+            search_q = Q()
+            if _is_field_visible(user, workspace, 'visit', 'reason'):
+                search_q |= Q(reason__icontains=q)
+            if _is_field_visible(user, workspace, 'visit', 'notes'):
+                search_q |= Q(notes__icontains=q)
+            if _is_field_visible(user, workspace, 'visit', 'follow_up'):
+                search_q |= Q(follow_up__icontains=q)
+            if _is_field_visible(user, workspace, 'visit', 'contact') and _is_field_visible(user, workspace, 'contact', 'name'):
+                search_q |= Q(contact__name__icontains=q)
+            if _is_field_visible(user, workspace, 'visit', 'assignee'):
+                search_q |= Q(assignee__email__icontains=q)
+            qs = qs.filter(search_q) if search_q else qs.none()
+        if query_params.get('contact_id') and _is_field_visible(user, workspace, 'visit', 'contact'):
+            qs = qs.filter(contact_id=_parse_fk_id(query_params.get('contact_id'), field_name=_get_contact_screen_label(workspace)))
+        if query_params.get('assignee_id') and _is_field_visible(user, workspace, 'visit', 'assignee'):
+            qs = qs.filter(assignee_id=_parse_fk_id(query_params.get('assignee_id'), field_name='Assignee'))
+        raw_follow_up = (query_params.get('has_follow_up') or '').strip().lower()
+        if raw_follow_up and _is_field_visible(user, workspace, 'visit', 'follow_up'):
+            if raw_follow_up in ('yes', 'true', '1', 'on'):
+                qs = qs.exclude(follow_up='')
+            elif raw_follow_up in ('no', 'false', '0', 'off'):
+                qs = qs.filter(follow_up='')
 
     elif object_key == 'ticket':
         if q:
@@ -1621,6 +1717,12 @@ def _compute_list_summary(workspace, object_key: str, qs, *, user=None) -> dict:
         return {
             'upcoming_count': qs.filter(status__in=('Scheduled', 'Confirmed')).count(),
             'completed_count': qs.filter(status='Completed').count(),
+        }
+    if object_key == 'visit':
+        if not _is_field_visible(user, workspace, 'visit', 'follow_up'):
+            return {}
+        return {
+            'with_follow_up_count': qs.exclude(follow_up='').count(),
         }
     if object_key == 'ticket':
         result = {}
@@ -1874,6 +1976,42 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
                 notes=_parse_optional_str(payload, 'notes', label='Notes', preserve_newlines=True),
             )
 
+        elif object_key == 'visit':
+            _reject_forbidden_visit_fields(payload)
+            contact_label = _get_contact_screen_label(workspace)
+            contact, _ = _resolve_contact(workspace, payload, user=user)
+            if contact is None:
+                raise CrmDomainError(
+                    f'A Visit must link to a {contact_label}.',
+                    status_code=400,
+                )
+            visited_at = _parse_datetime_value(
+                _first_present(payload, 'date', 'visited_at'),
+                field_name='Visit date',
+                user_timezone=user_tz,
+                required=True,
+            )
+            reason = _parse_required_str(payload, 'reason', label='Reason', max_length=255)
+            assignee = _resolve_assignee(workspace, payload)
+            record = Visit.objects.create(
+                workspace=workspace,
+                owner=user,
+                created_by=user,
+                visibility=visibility,
+                shared_role=shared_role,
+                contact=contact,
+                date=visited_at,
+                reason=reason,
+                notes=_parse_optional_str(payload, 'notes', label='Notes', preserve_newlines=True),
+                follow_up=_parse_optional_str(
+                    payload,
+                    'follow_up',
+                    label='Follow-up',
+                    preserve_newlines=True,
+                ),
+                assignee=assignee,
+            )
+
         elif object_key == 'ticket':
             title = _parse_required_str(
                 payload,
@@ -1979,6 +2117,7 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
             new_value=record_label,
             actor_kind=AuditLog.ACTOR_KIND_PERSON,
             actor_user=user,
+            record=record,
         )
 
     fresh = _build_base_queryset(workspace, object_key, user=user).get(pk=record.pk)
@@ -2411,6 +2550,63 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                     changes,
                 )
 
+        elif object_key == 'visit':
+            _reject_forbidden_visit_fields(payload)
+            contact_label = _get_contact_screen_label(workspace)
+            if _has_any_key(payload, 'date', 'visited_at'):
+                _apply_field_update(
+                    record,
+                    'date',
+                    _parse_datetime_value(
+                        _first_present(payload, 'date', 'visited_at'),
+                        field_name='Visit date',
+                        user_timezone=user_tz,
+                        required=True,
+                    ),
+                    changes,
+                )
+            if 'reason' in payload:
+                _apply_field_update(
+                    record,
+                    'reason',
+                    _parse_required_str(payload, 'reason', label='Reason', max_length=255),
+                    changes,
+                )
+            if 'notes' in payload:
+                _apply_field_update(
+                    record,
+                    'notes',
+                    _parse_optional_str(payload, 'notes', label='Notes', preserve_newlines=True),
+                    changes,
+                )
+            if 'follow_up' in payload:
+                _apply_field_update(
+                    record,
+                    'follow_up',
+                    _parse_optional_str(
+                        payload,
+                        'follow_up',
+                        label='Follow-up',
+                        preserve_newlines=True,
+                    ),
+                    changes,
+                )
+            if _has_any_key(payload, 'assignee_id', 'assignee'):
+                _apply_field_update(
+                    record,
+                    'assignee',
+                    _resolve_assignee(workspace, payload, existing=record),
+                    changes,
+                )
+            if _has_any_key(payload, 'contact_id', 'contact'):
+                next_contact, _ = _resolve_contact(workspace, payload, existing=record, user=user)
+                if next_contact is None:
+                    raise CrmDomainError(
+                        f'A Visit must link to a {contact_label}.',
+                        status_code=400,
+                    )
+                _apply_field_update(record, 'contact', next_contact, changes)
+
         elif object_key == 'ticket':
             if _has_any_key(payload, 'title', 'subject'):
                 _apply_field_update(
@@ -2568,6 +2764,7 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                     new_value=next_val,
                     actor_kind=AuditLog.ACTOR_KIND_PERSON,
                     actor_user=user,
+                    record=record,
                 )
 
     fresh = _build_base_queryset(workspace, object_key).get(pk=record.pk)
@@ -2619,6 +2816,11 @@ def delete_crm_record(workspace, user, object_key: str, record_id: int) -> dict:
                     f'Cannot delete this {contact_label} because one or more Appointments are linked to it.',
                     status_code=409,
                 )
+            if Visit.objects.filter(workspace=workspace, contact=record).exists():
+                raise CrmDomainError(
+                    f'Cannot delete this {contact_label} because one or more Visits are linked to it.',
+                    status_code=409,
+                )
             if Job.objects.filter(
                 workspace=workspace,
                 contact=record,
@@ -2637,6 +2839,9 @@ def delete_crm_record(workspace, user, object_key: str, record_id: int) -> dict:
 
         record_label = get_record_label(record, object_key)
         deleted_id = record.id
+        deleted_visibility = record.visibility
+        deleted_owner = record.owner
+        deleted_shared_role = record.shared_role
 
         if object_key != 'activity':
             Activity.objects.filter(
@@ -2657,6 +2862,9 @@ def delete_crm_record(workspace, user, object_key: str, record_id: int) -> dict:
             new_value=None,
             actor_kind=AuditLog.ACTOR_KIND_PERSON,
             actor_user=user,
+            record_visibility=deleted_visibility,
+            record_owner=deleted_owner,
+            record_shared_role=deleted_shared_role,
         )
 
     return {
@@ -2779,7 +2987,7 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
         .values_list('object_key', flat=True)
     )
 
-    s21_keys = ('account', 'contact', 'lead', 'deal', 'job', 'appointment', 'ticket', 'activity')
+    s21_keys = ('account', 'contact', 'lead', 'deal', 'job', 'appointment', 'visit', 'ticket', 'activity')
     readable_object_keys = [
         obj_key
         for obj_key in s21_keys
@@ -2814,6 +3022,10 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
             workspace=workspace,
             status__in=('Scheduled', 'Confirmed'),
         ).filter(vis_q).count()
+    if 'visit' in readable_object_keys and _is_field_visible(user, workspace, 'visit', 'follow_up'):
+        open_counts['visit_with_follow_up'] = Visit.objects.filter(
+            workspace=workspace,
+        ).exclude(follow_up='').filter(vis_q).count()
     if 'ticket' in readable_object_keys:
         open_counts['ticket_open'] = Ticket.objects.filter(
             workspace=workspace,
@@ -2843,17 +3055,17 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
         'deal': 'deals',
         'job': 'jobs',
         'appointment': 'appointments',
+        'visit': 'visits',
         'ticket': 'tickets',
     }
     for obj_key, pane_id in pane_map.items():
         if obj_key not in readable_object_keys:
             continue
         model_cls = CRM_MODELS_BY_KEY[obj_key]
-        rows = (
-            model_cls.objects.filter(workspace=workspace)
-            .filter(vis_q)
-            .order_by('-updated_at', '-id')[:4]
-        )
+        row_qs = model_cls.objects.filter(workspace=workspace).filter(vis_q)
+        if obj_key == 'visit':
+            row_qs = row_qs.select_related('contact')
+        rows = row_qs.order_by('-updated_at', '-id')[:4]
         for row in rows:
             meta_parts: list[str] = []
             if obj_key == 'account':
@@ -2886,6 +3098,18 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
             elif obj_key == 'appointment':
                 if _is_field_visible(user, workspace, 'appointment', 'status'):
                     meta_parts.append(row.status)
+            elif obj_key == 'visit':
+                if (
+                    _is_field_visible(user, workspace, 'visit', 'contact')
+                    and row.contact_id
+                    and row.contact
+                    and user_can_see_record(user, workspace, row.contact)
+                ):
+                    meta_parts.append(
+                        _get_visible_record_label(row.contact, 'contact', user=user, workspace=workspace)
+                    )
+                if _is_field_visible(user, workspace, 'visit', 'date') and row.date:
+                    meta_parts.append(row.date.strftime('%Y-%m-%d'))
             elif obj_key == 'ticket':
                 if _is_field_visible(user, workspace, 'ticket', 'status'):
                     meta_parts.append(row.status)

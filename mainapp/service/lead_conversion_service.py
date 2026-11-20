@@ -472,6 +472,7 @@ def _record_conversion_audits(
             new_value=account.name,
             actor_kind=AuditLog.ACTOR_KIND_PERSON,
             actor_user=user,
+            record=account,
         )
     if contact_created:
         record_audit_event(
@@ -485,6 +486,7 @@ def _record_conversion_audits(
             new_value=contact.name,
             actor_kind=AuditLog.ACTOR_KIND_PERSON,
             actor_user=user,
+            record=contact,
         )
     elif linked_existing_contact:
         record_audit_event(
@@ -498,6 +500,7 @@ def _record_conversion_audits(
             new_value=account.name,
             actor_kind=AuditLog.ACTOR_KIND_PERSON,
             actor_user=user,
+            record=contact,
         )
 
     record_audit_event(
@@ -511,6 +514,7 @@ def _record_conversion_audits(
         new_value=deal.title,
         actor_kind=AuditLog.ACTOR_KIND_PERSON,
         actor_user=user,
+        record=deal,
     )
 
     lead_label = get_record_label(lead, 'lead')
@@ -525,6 +529,7 @@ def _record_conversion_audits(
         new_value=Lead.STATUS_CONVERTED,
         actor_kind=AuditLog.ACTOR_KIND_PERSON,
         actor_user=user,
+        record=lead,
     )
     record_audit_event(
         workspace=workspace,
@@ -537,6 +542,7 @@ def _record_conversion_audits(
         new_value=f'{RECORD_CODE_PREFIXES["deal"]}-{deal.id} ({deal.title})',
         actor_kind=AuditLog.ACTOR_KIND_PERSON,
         actor_user=user,
+        record=lead,
     )
 
 
