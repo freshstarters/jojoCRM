@@ -200,7 +200,7 @@ def _object_payload(obj: ObjectDefinition, *, contact_label: str = 'Contact') ->
 
 
 def serialize_business_type_definition(bt: BusinessTypeDefinition) -> dict:
-    """Serialize one business type and its 12 catalog pack objects."""
+    """Serialize one business type, its 12 catalog pack objects, and its starter roles."""
     return {
         'key': bt.key,
         'label': bt.label,
@@ -213,6 +213,13 @@ def serialize_business_type_definition(bt: BusinessTypeDefinition) -> dict:
         ],
         'pack_table_count': len(bt.pack_objects),
         'total_starter_tables': len(CORE_OBJECTS) + len(bt.pack_objects),
+        'starter_roles': [
+            {
+                'name': role_def.name,
+                'description': role_def.description,
+            }
+            for role_def in (getattr(bt, 'starter_roles', ()) or ())
+        ],
     }
 
 
@@ -234,7 +241,9 @@ def initialize_workspace_catalog(
     *,
     actor_user=None,
 ) -> BusinessTypeDefinition:
-    """Create the primary WorkspacePack and 17 starter WorkspaceTable rows for a new workspace."""
+    """Create the primary WorkspacePack, 17 starter WorkspaceTable rows, and starter roles for a new workspace."""
+    from .role_service import seed_business_type_starter_roles
+
     bt = resolve_business_type(business_type_key)
     with transaction.atomic():
         WorkspacePack.objects.get_or_create(
@@ -265,6 +274,7 @@ def initialize_workspace_catalog(
                     'source_pack_key': bt.key,
                 },
             )
+        seed_business_type_starter_roles(workspace, bt, actor_user=actor_user)
     return bt
 
 

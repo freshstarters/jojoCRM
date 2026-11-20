@@ -1,4 +1,4 @@
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 import math
 from zoneinfo import ZoneInfo
@@ -29,7 +29,7 @@ from ..models import (
     WorkspaceRecordBase,
     WorkspaceTable,
 )
-from .audit_service import record_audit_event
+from .audit_service import list_workspace_audit_entries, record_audit_event
 from .cache_service import (
     DOMAIN_CATALOG,
     DOMAIN_LOOKUP_RECORDS,
@@ -3004,10 +3004,212 @@ def get_crm_options(workspace, user) -> dict:
     return dict(get_cached_crm_options_bundle(workspace, user)['payload'])
 
 
+_GHANA_CITY_TO_REGION: tuple[tuple[str, str], ...] = (
+    ('accra', 'Greater Accra'),
+    ('tema', 'Greater Accra'),
+    ('madina', 'Greater Accra'),
+    ('kasoa', 'Central'),
+    ('spintex', 'Greater Accra'),
+    ('east legon', 'Greater Accra'),
+    ('cantonments', 'Greater Accra'),
+    ('osu', 'Greater Accra'),
+    ('labadi', 'Greater Accra'),
+    ('kumasi', 'Ashanti'),
+    ('obuasi', 'Ashanti'),
+    ('suame', 'Ashanti'),
+    ('ejisu', 'Ashanti'),
+    ('takoradi', 'Western'),
+    ('sekondi', 'Western'),
+    ('tarkwa', 'Western'),
+    ('sefwi', 'Western North'),
+    ('bibiani', 'Western North'),
+    ('tamale', 'Northern'),
+    ('yendi', 'Northern'),
+    ('koforidua', 'Eastern'),
+    ('nsawam', 'Eastern'),
+    ('nkawkaw', 'Eastern'),
+    ('cape coast', 'Central'),
+    ('winneba', 'Central'),
+    ('ho', 'Volta'),
+    ('hohoe', 'Volta'),
+    ('keta', 'Volta'),
+    ('sunyani', 'Bono'),
+    ('berekum', 'Bono'),
+    ('techiman', 'Bono East'),
+    ('kintampo', 'Bono East'),
+    ('goaso', 'Ahafo'),
+    ('bolgatanga', 'Upper East'),
+    ('navrongo', 'Upper East'),
+    ('wa', 'Upper West'),
+    ('damongo', 'Savannah'),
+    ('nalerigu', 'North East'),
+    ('dambai', 'Oti'),
+)
+
+_DASHBOARD_PANE_MAP: dict[str, str] = {
+    'account': 'accounts',
+    'contact': 'contacts',
+    'lead': 'leads',
+    'deal': 'deals',
+    'job': 'jobs',
+    'appointment': 'appointments',
+    'visit': 'visits',
+    'ticket': 'tickets',
+}
+
+
+def _map_city_to_ghana_region(city: str | None) -> str | None:
+    cleaned = ' '.join((city or '').strip().lower().split())
+    if not cleaned:
+        return None
+    for token, region in _GHANA_CITY_TO_REGION:
+        if token in cleaned:
+            return region
+    return None
+
+
+def _build_dashboard_ghana_hubs(workspace, user, vis_q, readable_object_keys) -> dict | None:
+    if (
+        'account' not in readable_object_keys
+        or not _is_field_visible(user, workspace, 'account', 'city')
+    ):
+        return None
+
+    rows = (
+        Account.objects.filter(workspace=workspace)
+        .filter(vis_q)
+        .exclude(city='')
+        .values_list('city', flat=True)
+    )
+    city_counts: dict[str, tuple[str, int]] = {}
+    region_counts: dict[str, int] = {}
+    total_with_city = 0
+
+    for raw_city in rows:
+        city_name = ' '.join((raw_city or '').strip().split())
+        if not city_name:
+            continue
+        total_with_city += 1
+        region = _map_city_to_ghana_region(city_name)
+        key = city_name.lower()
+        prev = city_counts.get(key)
+        if prev is None:
+            city_counts[key] = (city_name, 1)
+        else:
+            city_counts[key] = (prev[0], prev[1] + 1)
+        if region:
+            region_counts[region] = region_counts.get(region, 0) + 1
+
+    sorted_cities = sorted(
+        city_counts.values(),
+        key=lambda item: (-item[1], item[0].lower()),
+    )[:4]
+    cities_payload = [
+        {
+            'name': name,
+            'region': _map_city_to_ghana_region(name) or 'Other',
+            'count': cnt,
+            'percent': round((cnt / total_with_city) * 100) if total_with_city else 0,
+        }
+        for name, cnt in sorted_cities
+    ]
+    regions_payload = {
+        region: {
+            'count': cnt,
+            'percent': round((cnt / total_with_city) * 100) if total_with_city else 0,
+        }
+        for region, cnt in sorted(
+            region_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    }
+    return {
+        'total_accounts_with_city': total_with_city,
+        'cities': cities_payload,
+        'regions': regions_payload,
+    }
+
+
+def _build_dashboard_velocity_series(
+    *,
+    deals_qs,
+    deal_readable: bool,
+    amount_visible: bool,
+    visit_qs,
+    appointment_qs,
+    activity_qs,
+    today: date,
+) -> dict[str, list[dict]]:
+    """Aggregate real record dates into week/month/year/all buckets for SVG charts."""
+    week_buckets: list[tuple[str, date, date]] = []
+    for offset in range(6, -1, -1):
+        d = today - timedelta(days=offset)
+        week_buckets.append((d.strftime('%a'), d, d))
+
+    month_buckets: list[tuple[str, date, date]] = []
+    for idx in range(3, -1, -1):
+        end_d = today - timedelta(days=idx * 7)
+        start_d = end_d - timedelta(days=6)
+        month_buckets.append((f'Wk {4 - idx}', start_d, end_d))
+
+    def _shift_month(base: date, delta_months: int) -> tuple[int, int]:
+        zero_m = (base.year * 12 + (base.month - 1)) + delta_months
+        return zero_m // 12, (zero_m % 12) + 1
+
+    year_buckets: list[tuple[str, date, date]] = []
+    for m_off in range(-5, 1):
+        yr, mo = _shift_month(today, m_off)
+        start_d = date(yr, mo, 1)
+        next_yr, next_mo = _shift_month(start_d, 1)
+        end_d = date(next_yr, next_mo, 1) - timedelta(days=1)
+        year_buckets.append((start_d.strftime('%b'), start_d, end_d))
+
+    records_with_dates: list[tuple[date, float]] = []
+    if deal_readable and deals_qs is not None:
+        for close_d, created_dt, amt in deals_qs.values_list('target_close_date', 'created_at', 'amount'):
+            ref_d = close_d or timezone.localdate(created_dt)
+            records_with_dates.append((ref_d, float(amt or 0) if amount_visible else 1.0))
+    else:
+        if visit_qs is not None:
+            for dt in visit_qs.values_list('date', flat=True):
+                if dt:
+                    records_with_dates.append((timezone.localdate(dt), 1.0))
+        if appointment_qs is not None:
+            for dt in appointment_qs.values_list('scheduled_at', flat=True):
+                if dt:
+                    records_with_dates.append((timezone.localdate(dt), 1.0))
+        if activity_qs is not None:
+            for due_dt, created_dt in activity_qs.values_list('due_at', 'created_at'):
+                ref_dt = due_dt or created_dt
+                if ref_dt:
+                    records_with_dates.append((timezone.localdate(ref_dt), 1.0))
+
+    def _fill(buckets: list[tuple[str, date, date]]) -> list[dict]:
+        series = []
+        for label, start_d, end_d in buckets:
+            cnt = 0
+            val = 0.0
+            for rec_d, metric in records_with_dates:
+                if start_d <= rec_d <= end_d:
+                    cnt += 1
+                    val += metric
+            series.append({'label': label, 'count': cnt, 'value': round(val, 2)})
+        return series
+
+    return {
+        'week': _fill(week_buckets),
+        'month': _fill(month_buckets),
+        'year': _fill(year_buckets),
+        'all': _fill(year_buckets),
+    }
+
+
 def _compute_workspace_dashboard_summary(workspace, user) -> dict:
-    """Compute role-, visibility-, and pack-aware record counts, pipeline metrics, and recent records."""
+    """Compute role-, visibility-, and pack-aware record counts, pipeline metrics, and bento widgets."""
     ensure_workspace_catalog(workspace)
     vis_q = build_record_visibility_q(user, workspace)
+    now = timezone.now()
+    today = timezone.localdate(now)
     enabled_keys = set(
         WorkspaceTable.objects.filter(workspace=workspace, is_enabled=True)
         .values_list('object_key', flat=True)
@@ -3065,26 +3267,217 @@ def _compute_workspace_dashboard_summary(workspace, user) -> dict:
         ).filter(vis_q).count()
 
     deal_summary = None
+    active_deals: list[dict] = []
+    deal_qs = None
     if 'deal' in readable_object_keys:
         deal_qs = Deal.objects.filter(workspace=workspace).filter(vis_q)
         stage_summary = _build_deal_stage_summary(workspace, deal_qs, user=user)
+        stage_counts = stage_summary.get('stage_counts') or {}
+        won_count = stage_counts.get('Won', 0)
+        lost_count = stage_counts.get('Lost', 0)
+        closed_count = won_count + lost_count
+        total_deal_count = counts_by_object.get('deal', 0)
+        open_deal_count = max(0, total_deal_count - closed_count)
+        win_rate = round((won_count / closed_count) * 100) if closed_count else None
         deal_summary = {
-            'total_count': counts_by_object.get('deal', 0),
+            'total_count': total_deal_count,
+            'open_count': open_deal_count,
+            'won_count': won_count,
+            'lost_count': lost_count,
+            'win_rate': win_rate,
             **stage_summary,
         }
 
+        acc_visible = _is_field_visible(user, workspace, 'deal', 'account')
+        con_visible = _is_field_visible(user, workspace, 'deal', 'contact')
+        amt_visible = _is_field_visible(user, workspace, 'deal', 'amount')
+        stage_visible = _is_field_visible(user, workspace, 'deal', 'stage')
+        prob_visible = _is_field_visible(user, workspace, 'deal', 'win_probability')
+        close_visible = _is_field_visible(user, workspace, 'deal', 'target_close_date')
+
+        for deal in deal_qs.select_related('account', 'contact', 'pipeline_stage').order_by('-updated_at', '-id')[:6]:
+            row = {
+                'id': deal.id,
+                'record_code': f'{RECORD_CODE_PREFIXES["deal"]}-{deal.id}',
+                'title': _get_visible_record_label(deal, 'deal', user=user, workspace=workspace),
+                'updated_at': deal.updated_at.isoformat(),
+            }
+            if acc_visible and deal.account_id and deal.account and user_can_see_record(user, workspace, deal.account):
+                row['account_id'] = deal.account_id
+                row['account_name'] = _get_visible_record_label(deal.account, 'account', user=user, workspace=workspace)
+            if con_visible and deal.contact_id and deal.contact and user_can_see_record(user, workspace, deal.contact):
+                row['contact_id'] = deal.contact_id
+                row['contact_name'] = _get_visible_record_label(deal.contact, 'contact', user=user, workspace=workspace)
+            if amt_visible and deal.amount is not None:
+                row['amount'] = f'{deal.amount:.2f}'
+            if stage_visible:
+                row['stage'] = deal.stage
+                row['stage_tone'] = _resolve_deal_stage_tone(deal)
+            if prob_visible and deal.win_probability is not None:
+                row['win_probability'] = int(deal.win_probability)
+            if close_visible and deal.target_close_date is not None:
+                row['target_close_date'] = deal.target_close_date.isoformat()
+            active_deals.append(row)
+
+    # Activity / Task Summary (Row 1 KPI & Row 2 Action Items Checklist)
+    task_summary = None
+    activity_breakdown = None
+    activity_qs = None
+    if 'activity' in readable_object_keys:
+        activity_qs = Activity.objects.filter(workspace=workspace).filter(vis_q)
+        type_rows = activity_qs.values('activity_type').annotate(cnt=Count('id'))
+        counts_by_type = {'note': 0, 'task': 0, 'call': 0, 'meeting': 0}
+        for row in type_rows:
+            t_key = row['activity_type']
+            if t_key in counts_by_type:
+                counts_by_type[t_key] = int(row['cnt'] or 0)
+        activity_breakdown = {
+            **counts_by_type,
+            'total': sum(counts_by_type.values()),
+        }
+
+        tasks_qs = activity_qs.filter(activity_type=Activity.TYPE_TASK)
+        task_total = tasks_qs.count()
+        completed_visible = _is_field_visible(user, workspace, 'activity', 'is_completed')
+        due_visible = _is_field_visible(user, workspace, 'activity', 'due_at')
+        completed_count = tasks_qs.filter(is_completed=True).count() if completed_visible else 0
+        open_task_count = max(0, task_total - completed_count) if completed_visible else task_total
+        overdue_count = (
+            tasks_qs.filter(is_completed=False, due_at__lt=now).count()
+            if (completed_visible and due_visible)
+            else 0
+        )
+        can_toggle_tasks = (
+            user_has_object_right(user, workspace, 'activity', 'update')
+            and (
+                is_workspace_owner(user, workspace)
+                or get_user_field_rights(user, workspace, 'activity').get('is_completed') == FIELD_RIGHT_EDITABLE
+            )
+        )
+
+        ordered_tasks = list(tasks_qs.order_by('is_completed', 'due_at', '-updated_at', '-id')[:6])
+        task_items: list[dict] = []
+        for act in ordered_tasks:
+            item = {
+                'id': act.id,
+                'record_code': f'{RECORD_CODE_PREFIXES["activity"]}-{act.id}',
+                'summary': _get_visible_record_label(act, 'activity', user=user, workspace=workspace),
+                'target_object_type': act.target_object_type,
+                'target_pane_id': _DASHBOARD_PANE_MAP.get(act.target_object_type),
+                'target_object_id': act.target_object_id,
+                'target_record_label': _resolve_target_record_label(
+                    workspace,
+                    act.target_object_type,
+                    act.target_object_id,
+                    user=user,
+                ),
+            }
+            if completed_visible:
+                item['is_completed'] = bool(act.is_completed)
+            if due_visible and act.due_at is not None:
+                item['due_at'] = act.due_at.isoformat()
+                item['is_overdue'] = bool((not act.is_completed) and act.due_at < now)
+            else:
+                item['is_overdue'] = False
+            task_items.append(item)
+
+        task_summary = {
+            'total_count': task_total,
+            'completed_count': completed_count,
+            'open_count': open_task_count,
+            'overdue_count': overdue_count,
+            'can_toggle': can_toggle_tasks,
+            'items': task_items,
+        }
+
+    # Visits & Appointments for Healthcare / service timelines
+    recent_visits: list[dict] = []
+    visit_qs = None
+    if 'visit' in readable_object_keys:
+        visit_qs = Visit.objects.filter(workspace=workspace).filter(vis_q)
+        v_con_vis = _is_field_visible(user, workspace, 'visit', 'contact')
+        v_date_vis = _is_field_visible(user, workspace, 'visit', 'date')
+        v_fu_vis = _is_field_visible(user, workspace, 'visit', 'follow_up')
+        for v in visit_qs.select_related('contact').order_by('-date', '-id')[:6]:
+            row = {
+                'id': v.id,
+                'record_code': f'{RECORD_CODE_PREFIXES["visit"]}-{v.id}',
+                'reason': _get_visible_record_label(v, 'visit', user=user, workspace=workspace),
+            }
+            if v_con_vis and v.contact_id and v.contact and user_can_see_record(user, workspace, v.contact):
+                row['contact_id'] = v.contact_id
+                row['contact_name'] = _get_visible_record_label(v.contact, 'contact', user=user, workspace=workspace)
+            if v_date_vis and v.date:
+                row['date'] = v.date.isoformat()
+            if v_fu_vis and v.follow_up:
+                row['follow_up'] = v.follow_up
+            recent_visits.append(row)
+
+    upcoming_appointments: list[dict] = []
+    appointment_qs = None
+    if 'appointment' in readable_object_keys:
+        appointment_qs = Appointment.objects.filter(workspace=workspace).filter(vis_q)
+        a_con_vis = _is_field_visible(user, workspace, 'appointment', 'contact')
+        a_sched_vis = _is_field_visible(user, workspace, 'appointment', 'scheduled_at')
+        a_status_vis = _is_field_visible(user, workspace, 'appointment', 'status')
+        for a in appointment_qs.select_related('contact').order_by('-scheduled_at', '-id')[:6]:
+            row = {
+                'id': a.id,
+                'record_code': f'{RECORD_CODE_PREFIXES["appointment"]}-{a.id}',
+                'title': _get_visible_record_label(a, 'appointment', user=user, workspace=workspace),
+            }
+            if a_con_vis and a.contact_id and a.contact and user_can_see_record(user, workspace, a.contact):
+                row['contact_id'] = a.contact_id
+                row['contact_name'] = _get_visible_record_label(a.contact, 'contact', user=user, workspace=workspace)
+            if a_sched_vis and a.scheduled_at:
+                row['scheduled_at'] = a.scheduled_at.isoformat()
+            if a_status_vis:
+                row['status'] = a.status
+            upcoming_appointments.append(row)
+
+    # Active Tickets SLA Queue (Row 3 Right Bottom)
+    active_tickets: list[dict] = []
+    if 'ticket' in readable_object_keys:
+        t_qs = Ticket.objects.filter(workspace=workspace).filter(vis_q).select_related('account', 'contact')
+        open_t = list(t_qs.filter(status__in=('New', 'Open', 'Pending')).order_by('-updated_at', '-id')[:4])
+        if len(open_t) < 4:
+            seen_ids = {t.id for t in open_t}
+            extra_t = list(t_qs.exclude(id__in=seen_ids).order_by('-updated_at', '-id')[: 4 - len(open_t)])
+            open_t.extend(extra_t)
+        t_status_vis = _is_field_visible(user, workspace, 'ticket', 'status')
+        t_prio_vis = _is_field_visible(user, workspace, 'ticket', 'priority')
+        t_acc_vis = _is_field_visible(user, workspace, 'ticket', 'account')
+        for t in open_t:
+            row = {
+                'id': t.id,
+                'record_code': f'{RECORD_CODE_PREFIXES["ticket"]}-{t.id}',
+                'title': _get_visible_record_label(t, 'ticket', user=user, workspace=workspace),
+                'updated_at': t.updated_at.isoformat(),
+            }
+            if t_status_vis:
+                row['status'] = t.status
+            if t_prio_vis:
+                row['priority'] = t.priority
+            if t_acc_vis and t.account_id and t.account and user_can_see_record(user, workspace, t.account):
+                row['account_name'] = _get_visible_record_label(t.account, 'account', user=user, workspace=workspace)
+            active_tickets.append(row)
+
+    ghana_hubs = _build_dashboard_ghana_hubs(workspace, user, vis_q, readable_object_keys)
+    velocity_series = _build_dashboard_velocity_series(
+        deals_qs=deal_qs,
+        deal_readable='deal' in readable_object_keys,
+        amount_visible=_is_field_visible(user, workspace, 'deal', 'amount'),
+        visit_qs=visit_qs,
+        appointment_qs=appointment_qs,
+        activity_qs=activity_qs,
+        today=today,
+    )
+
+    latest_audit_res = list_workspace_audit_entries(workspace, user, page=1, page_size=1)
+    latest_audit = latest_audit_res['results'][0] if latest_audit_res.get('results') else None
+
     recent_candidates: list[tuple[datetime, dict]] = []
-    pane_map = {
-        'account': 'accounts',
-        'contact': 'contacts',
-        'lead': 'leads',
-        'deal': 'deals',
-        'job': 'jobs',
-        'appointment': 'appointments',
-        'visit': 'visits',
-        'ticket': 'tickets',
-    }
-    for obj_key, pane_id in pane_map.items():
+    for obj_key, pane_id in _DASHBOARD_PANE_MAP.items():
         if obj_key not in readable_object_keys:
             continue
         model_cls = CRM_MODELS_BY_KEY[obj_key]
@@ -3167,6 +3560,15 @@ def _compute_workspace_dashboard_summary(workspace, user) -> dict:
         'readable_object_keys': readable_object_keys,
         'open_counts': open_counts,
         'deal_summary': deal_summary,
+        'task_summary': task_summary,
+        'activity_breakdown': activity_breakdown,
+        'active_deals': active_deals,
+        'recent_visits': recent_visits,
+        'upcoming_appointments': upcoming_appointments,
+        'active_tickets': active_tickets,
+        'ghana_hubs': ghana_hubs,
+        'velocity_series': velocity_series,
+        'latest_audit': latest_audit,
         'recent_records': recent_records,
     }
 
@@ -3176,7 +3578,7 @@ def get_cached_dashboard_summary_bundle(workspace, user) -> dict:
     caller_scope = build_caller_cache_scope(user, workspace)
     return get_or_set_workspace_cache_bundle(
         workspace.id,
-        domains=(DOMAIN_CATALOG, DOMAIN_RECORDS, DOMAIN_ROLES),
+        domains=(DOMAIN_CATALOG, DOMAIN_RECORDS, DOMAIN_ROLES, DOMAIN_MEMBERS),
         key_suffix=f'dashboard:{caller_scope}',
         scope=f'dashboard:{caller_scope}',
         loader=lambda: _compute_workspace_dashboard_summary(workspace, user),

@@ -10,7 +10,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpResponseNotModified
 
 try:
     from redis.exceptions import RedisError
@@ -33,7 +33,7 @@ ALL_WORKSPACE_DOMAINS: tuple[str, ...] = (
     DOMAIN_ROLES,
 )
 
-STATIC_CATALOG_CACHE_KEY = 'static:catalog:business_types:v1'
+STATIC_CATALOG_CACHE_KEY = 'static:catalog:business_types:v2'
 
 _CACHE_TRANSPORT_ERRORS = (
     (RedisError, OSError, TimeoutError, ConnectionError, ValueError)
@@ -240,7 +240,7 @@ def build_cached_json_response(
 ) -> HttpResponse:
     """Build a JSON HttpResponse or 304 Not Modified with ETag, Cache-Control, Vary, and X-Cache."""
     if etag_matches(request.META.get('HTTP_IF_NONE_MATCH'), etag):
-        response = HttpResponse(status=304)
+        response = HttpResponseNotModified()
     else:
         response = HttpResponse(body_text, status=status, content_type='application/json')
 

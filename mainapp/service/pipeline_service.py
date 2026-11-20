@@ -15,8 +15,12 @@ from ..models import (
 )
 from .audit_service import record_audit_event
 from .cache_service import (
+    DOMAIN_CATALOG,
     DOMAIN_LOOKUP_RECORDS,
     DOMAIN_RECORDS,
+    DOMAIN_ROLES,
+    build_caller_cache_scope,
+    get_or_set_workspace_cache_bundle,
     invalidate_workspace_cache,
 )
 from .catalog_service import ensure_workspace_catalog
@@ -311,6 +315,19 @@ def get_workspace_pipeline_detail(workspace, user) -> dict:
             'can_update_deals': can_update_deals,
         },
     }
+
+
+def get_cached_workspace_pipeline_detail_bundle(workspace, user) -> dict:
+    """Return cached pipeline detail with serialized JSON text and ETag, scoped to workspace and caller."""
+    ensure_workspace_pipeline(workspace, require_enabled=True)
+    caller_scope = build_caller_cache_scope(user, workspace)
+    return get_or_set_workspace_cache_bundle(
+        workspace.id,
+        domains=(DOMAIN_CATALOG, DOMAIN_RECORDS, DOMAIN_LOOKUP_RECORDS, DOMAIN_ROLES),
+        key_suffix=f'pipeline_detail:{caller_scope}',
+        scope=f'pipeline_detail:{caller_scope}',
+        loader=lambda: get_workspace_pipeline_detail(workspace, user),
+    )
 
 
 def rename_workspace_pipeline(workspace, user, payload: dict) -> dict:

@@ -3,8 +3,10 @@ from django.views.decorators.http import require_http_methods
 
 from ..helpers.crm_errors import CrmDomainError
 from ..helpers.request_helpers import parse_json_object, require_workspace_member
+from ..service.cache_service import build_cached_json_response
 from ..service.pipeline_service import (
     add_pipeline_stage,
+    get_cached_workspace_pipeline_detail_bundle,
     get_workspace_pipeline_detail,
     remove_pipeline_stage,
     rename_workspace_pipeline,
@@ -22,7 +24,15 @@ def workspace_pipelines_view(request, slug: str):
 
     try:
         if request.method == 'GET':
-            return JsonResponse(get_workspace_pipeline_detail(workspace, user), status=200)
+            bundle = get_cached_workspace_pipeline_detail_bundle(workspace, user)
+            return build_cached_json_response(
+                request,
+                body_text=bundle['body_text'],
+                etag=bundle['etag'],
+                cache_control='private, no-cache',
+                vary='Cookie',
+                cache_hit=bundle['cache_hit'],
+            )
 
         payload, parse_error = parse_json_object(request)
         if parse_error is not None:

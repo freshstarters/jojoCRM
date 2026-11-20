@@ -3,6 +3,13 @@ from django.contrib.auth import logout
 from .service.role_service import compute_user_permissions_version
 from .service.session_service import SESSION_VERSION_KEY
 
+PUBLIC_STATELESS_PATHS = frozenset(
+    {
+        '/api/v1/catalog/business-types/',
+        '/api/v1/hello/',
+    }
+)
+
 
 class ActiveSessionEnforcementMiddleware:
     """Log out sessions immediately when deactivated and emit live X-Permissions-Version headers."""
@@ -11,6 +18,9 @@ class ActiveSessionEnforcementMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
+        if request.path in PUBLIC_STATELESS_PATHS:
+            return self.get_response(request)
+
         user = getattr(request, 'user', None)
         if user is not None and getattr(user, 'is_authenticated', False):
             session_ver = request.session.get(SESSION_VERSION_KEY)

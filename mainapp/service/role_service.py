@@ -395,6 +395,82 @@ def ensure_workspace_default_roles(workspace) -> tuple[Role, Role]:
     return owner_role, staff_role
 
 
+def seed_business_type_starter_roles(
+    workspace,
+    business_type,
+    *,
+    actor_user=None,
+) -> list[Role]:
+    """Create the business type's 4 editable, deletable starter roles on initial workspace creation."""
+    if workspace is None or business_type is None:
+        return []
+
+    ensure_workspace_default_roles(workspace)
+    starter_specs = getattr(business_type, 'starter_roles', ()) or ()
+    created_roles: list[Role] = []
+
+    for spec in starter_specs:
+        if Role.objects.filter(workspace=workspace, name__iexact=spec.name).exists():
+            continue
+
+        obj_rights = build_default_object_rights(is_owner=False)
+        for obj_key, perms in spec.restricted_objects:
+            if obj_key in obj_rights and len(perms) == 4:
+                obj_rights[obj_key] = {
+                    'create': bool(perms[0]),
+                    'read': bool(perms[1]),
+                    'update': bool(perms[2]),
+                    'delete': bool(perms[3]),
+                }
+
+        field_rights = build_default_field_rights()
+        for obj_key, field_key, level in spec.field_rights:
+            if (
+                obj_key in field_rights
+                and field_key in field_rights[obj_key]
+                and level in FIELD_RIGHT_LEVELS
+            ):
+                field_rights[obj_key][field_key] = level
+
+        switches_set = set(spec.switches)
+        role = Role.objects.create(
+            workspace=workspace,
+            name=spec.name,
+            description=spec.description,
+            is_owner=False,
+            is_default_staff=False,
+            can_manage_seat_plan=False,
+            can_manage_sms_wallet=False,
+            allow_import='allow_import' in switches_set,
+            allow_export='allow_export' in switches_set,
+            automations='automations' in switches_set,
+            scripts='scripts' in switches_set,
+            users_and_roles='users_and_roles' in switches_set,
+            theme_and_layouts='theme_and_layouts' in switches_set,
+            unattended_agent='unattended_agent' in switches_set,
+            object_rights=obj_rights,
+            field_rights=field_rights,
+        )
+        record_audit_event(
+            workspace=workspace,
+            object_type='role',
+            object_id=role.id,
+            record_label=role.name,
+            action=AuditLog.ACTION_CREATE,
+            field_name='role',
+            previous_value=None,
+            new_value=role.name,
+            actor_kind=AuditLog.ACTOR_KIND_SCRIPT if actor_user is None else AuditLog.ACTOR_KIND_PERSON,
+            actor_user=actor_user,
+            actor_label='' if actor_user is not None else 'Workspace setup',
+        )
+        created_roles.append(role)
+
+    if created_roles:
+        invalidate_workspace_cache(workspace.id, domains=(DOMAIN_ROLES,))
+    return created_roles
+
+
 def clone_role_from_source(
     workspace,
     *,
