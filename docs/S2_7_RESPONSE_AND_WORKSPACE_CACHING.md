@@ -24,10 +24,11 @@ S2.7 configures server-side caching (`CACHES`), HTTP conditional caching (`ETag`
 
 ### Static Starter Catalog
 - **`GET /api/v1/catalog/business-types/`** ([`mainapp/views/public_views.py`](../mainapp/views/public_views.py)):
-  - Caches pre-serialized canonical UTF-8 JSON text and strong SHA-256 `ETag` under `static:catalog:business_types:v1` (`STATIC_CATALOG_CACHE_TTL`).
+  - Caches pre-serialized canonical UTF-8 JSON text and strong SHA-256 `ETag` under `static:catalog:business_types:v2` (`STATIC_CATALOG_CACHE_TTL`).
+  - `ActiveSessionEnforcementMiddleware` bypasses session inspection on `PUBLIC_STATELESS_PATHS` (`/api/v1/catalog/business-types/`, `/api/v1/hello/`) so anonymous catalog responses emit `Vary: Accept-Encoding` without `Vary: Cookie`.
   - Cache hits never re-run `serialize_business_type_catalog()` or `json.dumps()`.
   - Emits `Cache-Control: public, max-age=3600, stale-while-revalidate=86400`, `Vary: Accept-Encoding`, `ETag`, and `X-Cache: HIT | MISS`.
-  - Supports RFC 9110 weak/strong `If-None-Match` comparison (including `W/` prefixes, comma-separated lists, and `*`) returning `304 Not Modified`.
+  - Supports RFC 9110 weak/strong `If-None-Match` comparison (including `W/` prefixes, comma-separated lists, and `*`) returning `HttpResponseNotModified()` (`304 Not Modified` without injecting a `text/html` `Content-Type`).
 
 ### Workspace & Caller-Scoped Caching
 Workspace caches use per-workspace UUID version tokens across **5 invalidation domains**:
@@ -43,7 +44,8 @@ Cached surfaces:
 - **Active seat count** (`count_active_seats` in [`mainapp/service/role_service.py`](../mainapp/service/role_service.py)) — domain: `members`.
 - **`GET /api/v1/workspaces/<slug>/`** ([`mainapp/views/workspace_views.py`](../mainapp/views/workspace_views.py)) — domains: `catalog`, `members`, `roles`; scoped per `user.id` + `build_caller_cache_scope()`.
 - **`GET /api/v1/workspaces/<slug>/packs/`** (`workspace_views.py` / `get_cached_workspace_packs_detail_bundle`) — domains: `catalog`, `records`.
-- **`GET /api/v1/workspaces/<slug>/dashboard/`** ([`mainapp/views/crm_views.py`](../mainapp/views/crm_views.py) / `get_cached_dashboard_summary_bundle`) — domains: `catalog`, `records`, `roles`; scoped per caller (`owner.<perm_hash>` or `user.<id>.<perm_hash>`).
+- **`GET /api/v1/workspaces/<slug>/dashboard/`** ([`mainapp/views/crm_views.py`](../mainapp/views/crm_views.py) / `get_cached_dashboard_summary_bundle`) — domains: `catalog`, `records`, `roles`, `members`; scoped per caller (`owner.<perm_hash>` or `user.<id>.<perm_hash>`). Returns KPI counts, `deal_summary`, `task_summary`, `activity_breakdown`, `active_deals`, `recent_visits`, `upcoming_appointments`, `active_tickets`, `ghana_hubs`, `velocity_series`, and `latest_audit`.
+- **`GET /api/v1/workspaces/<slug>/pipelines/`** ([`mainapp/views/pipeline_views.py`](../mainapp/views/pipeline_views.py) / `get_cached_workspace_pipeline_detail_bundle` in [`mainapp/service/pipeline_service.py`](../mainapp/service/pipeline_service.py)) — domains: `catalog`, `records`, `roles`; scoped per caller (`owner` or `user.<id>.<perm_hash>`).
 - **`GET /api/v1/workspaces/<slug>/crm/options/`** (`crm_views.py` / `get_cached_crm_options_bundle`) — domains: `catalog`, `lookup_records`, `members`, `roles`; scoped per caller (`owner.<perm_hash>` or `user.<id>.<perm_hash>`).
 - **`GET /api/v1/auth/session/`** ([`mainapp/views/auth_views.py`](../mainapp/views/auth_views.py)) — emits `Cache-Control: private, no-store` and `Vary: Cookie` while internally reusing cached workspace catalog summary and active seat count.
 
