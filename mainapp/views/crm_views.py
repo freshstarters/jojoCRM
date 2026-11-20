@@ -14,6 +14,7 @@ from ..service.audit_service import (
     MAX_RECORD_AUDIT_PAGE_SIZE,
     list_record_audit_entries,
 )
+from ..service.cache_service import build_cached_json_response
 from ..service.crm_service import (
     CRM_MODELS_BY_KEY,
     DEFAULT_BOARD_PER_STAGE_LIMIT,
@@ -22,10 +23,10 @@ from ..service.crm_service import (
     create_crm_record,
     delete_crm_record,
     ensure_object_permission,
-    get_crm_options,
+    get_cached_crm_options_bundle,
+    get_cached_dashboard_summary_bundle,
     get_crm_record_detail,
     get_deals_board,
-    get_workspace_dashboard_summary,
     list_crm_records,
     resolve_object_key,
     update_crm_record,
@@ -43,7 +44,15 @@ def workspace_dashboard_view(request, slug: str):
     user, workspace, error_response = require_workspace_member(request, slug)
     if error_response is not None:
         return error_response
-    return JsonResponse(get_workspace_dashboard_summary(workspace, user), status=200)
+    bundle = get_cached_dashboard_summary_bundle(workspace, user)
+    return build_cached_json_response(
+        request,
+        body_text=bundle['body_text'],
+        etag=bundle['etag'],
+        cache_control='private, no-cache',
+        vary='Cookie',
+        cache_hit=bundle['cache_hit'],
+    )
 
 
 @require_GET
@@ -52,7 +61,15 @@ def workspace_crm_options_view(request, slug: str):
     user, workspace, error_response = require_workspace_member(request, slug)
     if error_response is not None:
         return error_response
-    return JsonResponse(get_crm_options(workspace, user), status=200)
+    bundle = get_cached_crm_options_bundle(workspace, user)
+    return build_cached_json_response(
+        request,
+        body_text=bundle['body_text'],
+        etag=bundle['etag'],
+        cache_control='private, no-cache',
+        vary='Cookie',
+        cache_hit=bundle['cache_hit'],
+    )
 
 
 @require_GET

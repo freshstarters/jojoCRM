@@ -528,16 +528,22 @@ def password_reset_confirm_view(request):
 @require_GET
 def auth_session_view(request):
     """Return current session status without mutating state."""
+    def _no_store_json(payload: dict) -> JsonResponse:
+        resp = JsonResponse(payload, status=200)
+        resp["Cache-Control"] = "private, no-store"
+        resp["Vary"] = "Cookie"
+        return resp
+
     if not request.user.is_authenticated:
-        return JsonResponse({"authenticated": False}, status=200)
+        return _no_store_json({"authenticated": False})
 
     if not getattr(request.user, "is_active", False):
         logout(request)
-        return JsonResponse({"authenticated": False}, status=200)
+        return _no_store_json({"authenticated": False})
 
     workspace = getattr(request.user, "workspace", None)
     if not getattr(request.user, "email_verified", False) or workspace is None:
-        return JsonResponse(
+        return _no_store_json(
             {
                 "authenticated": False,
                 "verification_required": True,
@@ -547,10 +553,9 @@ def auth_session_view(request):
                     if workspace is not None
                     else None
                 ),
-            },
-            status=200,
+            }
         )
 
     payload = serialize_workspace_and_user(workspace, request.user)
     payload["authenticated"] = True
-    return JsonResponse(payload, status=200)
+    return _no_store_json(payload)

@@ -17,9 +17,18 @@ from ..service.audit_service import (
     list_workspace_audit_entries,
     record_audit_event,
 )
+from ..service.cache_service import (
+    DOMAIN_CATALOG,
+    DOMAIN_MEMBERS,
+    DOMAIN_ROLES,
+    build_cached_json_response,
+    build_caller_cache_scope,
+    get_or_set_workspace_cache_bundle,
+)
 from ..service.catalog_service import (
     CatalogError,
     enable_pack_for_workspace,
+    get_cached_workspace_packs_detail_bundle,
     serialize_workspace_packs_detail,
     set_workspace_table_enabled,
 )
@@ -56,9 +65,21 @@ def workspace_detail_view(request, slug):
     if request.method == "PATCH":
         return update_workspace_profile_response(request, user, workspace)
 
-    return JsonResponse(
-        serialize_workspace_and_user(workspace, user),
-        status=200,
+    caller_scope = build_caller_cache_scope(user, workspace)
+    bundle = get_or_set_workspace_cache_bundle(
+        workspace.id,
+        domains=(DOMAIN_CATALOG, DOMAIN_MEMBERS, DOMAIN_ROLES),
+        key_suffix=f'workspace_detail:{user.id}:{caller_scope}',
+        scope=f'workspace_detail:{user.id}:{caller_scope}',
+        loader=lambda: serialize_workspace_and_user(workspace, user),
+    )
+    return build_cached_json_response(
+        request,
+        body_text=bundle['body_text'],
+        etag=bundle['etag'],
+        cache_control='private, no-cache',
+        vary='Cookie',
+        cache_hit=bundle['cache_hit'],
     )
 
 
@@ -179,7 +200,15 @@ def workspace_packs_view(request, slug: str):
         _user, workspace, error_response = require_workspace_member(request, slug)
         if error_response is not None:
             return error_response
-        return JsonResponse(serialize_workspace_packs_detail(workspace), status=200)
+        bundle = get_cached_workspace_packs_detail_bundle(workspace)
+        return build_cached_json_response(
+            request,
+            body_text=bundle['body_text'],
+            etag=bundle['etag'],
+            cache_control='private, no-cache',
+            vary='Cookie',
+            cache_hit=bundle['cache_hit'],
+        )
 
     user, workspace, error_response = _require_catalog_management_permission(request, slug)
     if error_response is not None:
