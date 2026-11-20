@@ -6,6 +6,13 @@ from django.db.models import Count, IntegerField, OuterRef, Subquery, Value
 from django.db.models.functions import Coalesce
 
 from .audit_service import record_audit_event
+from .cache_service import (
+    DOMAIN_CATALOG,
+    DOMAIN_RECORDS,
+    compute_etag,
+    get_or_set_workspace_cache_bundle,
+    serialize_json_bytes,
+)
 from ..catalog import (
     ALL_OBJECTS,
     BUSINESS_TYPES,
@@ -81,24 +88,15 @@ def get_table_record_count(workspace, object_key: str) -> int:
     return 0
 
 
-def get_workspace_table_record_counts(
-    workspace,
-    object_keys: list[str] | tuple[str, ...] | None = None,
-) -> dict[str, int]:
-    """Return a map of object_key -> stored record count for a workspace in one batched query."""
-    keys = tuple(object_keys) if object_keys is not None else tuple(OBJECTS_BY_KEY.keys())
-    counts: dict[str, int] = {key: 0 for key in keys}
+def _compute_db_table_record_counts(workspace) -> dict[str, int]:
+    """Compute stored row counts across all DB-backed starter object keys in one batched query."""
+    all_keys = tuple(OBJECTS_BY_KEY.keys())
+    counts: dict[str, int] = {key: 0 for key in all_keys}
     if workspace is None:
         return counts
 
     annotations = {}
-    for key in keys:
-        if key not in OBJECTS_BY_KEY:
-            continue
-        resolver = OBJECT_RECORD_COUNT_RESOLVERS.get(key)
-        if resolver is not None:
-            counts[key] = max(0, int(resolver(workspace)))
-            continue
+    for key in all_keys:
         model_name = OBJECT_MODEL_NAMES.get(key)
         if not model_name:
             continue
@@ -128,6 +126,30 @@ def get_workspace_table_record_counts(
             counts[ann_key[4:]] = max(0, int(val or 0))
 
     return counts
+
+
+def get_workspace_table_record_counts(
+    workspace,
+    object_keys: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, int]:
+    """Return a map of object_key -> stored record count for a workspace (cached per workspace)."""
+    keys = tuple(object_keys) if object_keys is not None else tuple(OBJECTS_BY_KEY.keys())
+    if workspace is None:
+        return {key: 0 for key in keys}
+
+    bundle = get_or_set_workspace_cache_bundle(
+        workspace.id,
+        domains=(DOMAIN_RECORDS,),
+        key_suffix='table_counts',
+        scope='table_counts',
+        loader=lambda: _compute_db_table_record_counts(workspace),
+    )
+    all_counts = dict(bundle['payload'])
+    for key, resolver in OBJECT_RECORD_COUNT_RESOLVERS.items():
+        if key in OBJECTS_BY_KEY:
+            all_counts[key] = max(0, int(resolver(workspace)))
+
+    return {key: all_counts.get(key, 0) for key in keys}
 
 
 def pluralize_contact_label(label: str) -> str:
@@ -478,8 +500,8 @@ def set_workspace_table_enabled(
     }
 
 
-def serialize_workspace_catalog_summary(workspace) -> dict:
-    """Serialize compact workspace business-type, label, enabled packs, and enabled table keys."""
+def _compute_workspace_catalog_summary(workspace) -> dict:
+    """Compute compact workspace business-type, label, enabled packs, and enabled table keys."""
     ensure_workspace_catalog(workspace)
     packs = list(WorkspacePack.objects.filter(workspace=workspace).order_by('-is_primary', 'created_at', 'id'))
     enabled_table_rows = list(
@@ -504,8 +526,22 @@ def serialize_workspace_catalog_summary(workspace) -> dict:
     }
 
 
-def serialize_workspace_packs_detail(workspace) -> dict:
-    """Serialize full workspace packs, all 30 catalog tables with record counts, and toggles."""
+def serialize_workspace_catalog_summary(workspace) -> dict:
+    """Return cached workspace business-type, label, enabled packs, and enabled table keys."""
+    if workspace is None or not getattr(workspace, 'id', None):
+        return _compute_workspace_catalog_summary(workspace)
+    bundle = get_or_set_workspace_cache_bundle(
+        workspace.id,
+        domains=(DOMAIN_CATALOG,),
+        key_suffix='catalog_summary',
+        scope='catalog_summary',
+        loader=lambda: _compute_workspace_catalog_summary(workspace),
+    )
+    return dict(bundle['payload'])
+
+
+def _compute_workspace_packs_detail(workspace) -> dict:
+    """Compute full workspace packs, all 30 catalog tables with record counts, and toggles."""
     ensure_workspace_catalog(workspace)
     contact_label = (workspace.contact_label or 'Contact').strip() or 'Contact'
     packs_by_key = {
@@ -573,3 +609,28 @@ def serialize_workspace_packs_detail(workspace) -> dict:
         'tables': serialized_tables,
         'packs': serialized_packs,
     }
+
+
+def get_cached_workspace_packs_detail_bundle(workspace) -> dict:
+    """Return workspace packs detail with serialized JSON and ETag, cached per workspace."""
+    if OBJECT_RECORD_COUNT_RESOLVERS:
+        payload = _compute_workspace_packs_detail(workspace)
+        body_bytes = serialize_json_bytes(payload)
+        return {
+            'payload': payload,
+            'body_text': body_bytes.decode('utf-8'),
+            'etag': compute_etag(body_bytes, scope=f'ws:{workspace.id}:packs_detail'),
+            'cache_hit': False,
+        }
+    return get_or_set_workspace_cache_bundle(
+        workspace.id,
+        domains=(DOMAIN_CATALOG, DOMAIN_RECORDS),
+        key_suffix='packs_detail',
+        scope='packs_detail',
+        loader=lambda: _compute_workspace_packs_detail(workspace),
+    )
+
+
+def serialize_workspace_packs_detail(workspace) -> dict:
+    """Serialize full workspace packs, all 30 catalog tables with record counts, and toggles."""
+    return dict(get_cached_workspace_packs_detail_bundle(workspace)['payload'])

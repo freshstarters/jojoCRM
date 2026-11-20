@@ -18,6 +18,12 @@ from ..models import (
     Visit,
 )
 from .audit_service import record_audit_event
+from .cache_service import (
+    DOMAIN_MEMBERS,
+    DOMAIN_ROLES,
+    get_or_set_workspace_cache_bundle,
+    invalidate_workspace_cache,
+)
 
 CRUD_ACTIONS: tuple[str, ...] = ('create', 'read', 'update', 'delete')
 
@@ -376,13 +382,16 @@ def ensure_workspace_default_roles(workspace) -> tuple[Role, Role]:
         staff_role.save(update_fields=[*staff_update_fields, 'updated_at'])
 
     staff_qs = workspace.users.filter(role__isnull=True)
+    updated_users = 0
     if workspace.created_by_id is not None:
-        workspace.users.filter(
+        updated_users += workspace.users.filter(
             id=workspace.created_by_id,
             role__isnull=True,
         ).update(role=owner_role)
         staff_qs = staff_qs.exclude(id=workspace.created_by_id)
-    staff_qs.update(role=staff_role)
+    updated_users += staff_qs.update(role=staff_role)
+    if updated_users:
+        invalidate_workspace_cache(workspace.id, domains=(DOMAIN_MEMBERS, DOMAIN_ROLES))
     return owner_role, staff_role
 
 
@@ -641,7 +650,14 @@ def fallback_role_shared_records_to_owner(workspace, role: Role, *, acting_user)
 
 
 def count_active_seats(workspace) -> int:
-    """Count active verified workspace members who can sign in as paid seats."""
-    if workspace is None:
+    """Count active verified workspace members who can sign in as paid seats (cached per workspace)."""
+    if workspace is None or not getattr(workspace, 'id', None):
         return 0
-    return workspace.users.filter(is_active=True, email_verified=True).count()
+    bundle = get_or_set_workspace_cache_bundle(
+        workspace.id,
+        domains=(DOMAIN_MEMBERS,),
+        key_suffix='active_seats',
+        scope='active_seats',
+        loader=lambda: workspace.users.filter(is_active=True, email_verified=True).count(),
+    )
+    return int(bundle['payload'])

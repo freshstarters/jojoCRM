@@ -2,6 +2,8 @@ from django.contrib.sessions.models import Session
 from django.db.models import F
 from django.utils import timezone
 
+from .cache_service import DOMAIN_MEMBERS, DOMAIN_ROLES, invalidate_workspace_cache
+
 SESSION_VERSION_KEY = '_jojocrm_session_version'
 # Upper bound on non-expired session rows decoded per invalidation. Revocation itself is
 # enforced on every request by ActiveSessionEnforcementMiddleware via session_version, so
@@ -25,6 +27,10 @@ def invalidate_user_sessions(user, *, exclude_session_key: str | None = None) ->
         session_version=F('session_version') + 1
     )
     user.refresh_from_db(fields=['session_version'])
+    invalidate_workspace_cache(
+        getattr(user, 'workspace_id', None),
+        domains=(DOMAIN_MEMBERS, DOMAIN_ROLES),
+    )
 
     now = timezone.now()
     Session.objects.filter(expire_date__lt=now).delete()

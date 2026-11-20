@@ -14,6 +14,11 @@ from ..models import (
     WorkspaceTable,
 )
 from .audit_service import record_audit_event
+from .cache_service import (
+    DOMAIN_LOOKUP_RECORDS,
+    DOMAIN_RECORDS,
+    invalidate_workspace_cache,
+)
 from .catalog_service import ensure_workspace_catalog
 from .role_service import user_can_manage_sales_settings, user_has_object_right
 
@@ -245,6 +250,10 @@ def _resequence_stages(stages: list[PipelineStage], now) -> None:
             to_update.append(stage)
     if to_update:
         PipelineStage.objects.bulk_update(to_update, ['position', 'updated_at'])
+        invalidate_workspace_cache(
+            to_update[0].workspace_id,
+            domains=(DOMAIN_RECORDS, DOMAIN_LOOKUP_RECORDS),
+        )
 
 
 def get_workspace_pipeline_detail(workspace, user) -> dict:
@@ -472,6 +481,10 @@ def update_pipeline_stage(workspace, user, stage_id: int, payload: dict) -> dict
                     stage=next_name,
                     updated_at=now,
                 )
+                invalidate_workspace_cache(
+                    workspace.id,
+                    domains=(DOMAIN_RECORDS, DOMAIN_LOOKUP_RECORDS),
+                )
                 updated_deals_count = len(affected_deals)
                 audit_rows = _build_deal_stage_audit_rows(
                     workspace,
@@ -663,6 +676,10 @@ def remove_pipeline_stage(
                 pipeline_stage=dest_stage,
                 stage=dest_stage.name,
                 updated_at=now,
+            )
+            invalidate_workspace_cache(
+                workspace.id,
+                domains=(DOMAIN_RECORDS, DOMAIN_LOOKUP_RECORDS),
             )
             moved_deals_count = len(deals_on_stage)
             dest_stage_name = dest_stage.name

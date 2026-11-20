@@ -30,6 +30,15 @@ from ..models import (
     WorkspaceTable,
 )
 from .audit_service import record_audit_event
+from .cache_service import (
+    DOMAIN_CATALOG,
+    DOMAIN_LOOKUP_RECORDS,
+    DOMAIN_MEMBERS,
+    DOMAIN_RECORDS,
+    DOMAIN_ROLES,
+    build_caller_cache_scope,
+    get_or_set_workspace_cache_bundle,
+)
 from .catalog_service import ensure_workspace_catalog, get_workspace_table_record_counts
 from .pipeline_service import (
     ensure_workspace_pipeline,
@@ -2874,8 +2883,8 @@ def delete_crm_record(workspace, user, object_key: str, record_id: int) -> dict:
     }
 
 
-def get_crm_options(workspace, user) -> dict:
-    """Return workspace assignees, roles, readable Accounts/Contacts summaries, and choice constants."""
+def _compute_crm_options(workspace, user) -> dict:
+    """Compute workspace assignees, roles, readable Accounts/Contacts summaries, and choice constants."""
     ensure_workspace_default_roles(workspace)
     vis_q = build_record_visibility_q(user, workspace)
 
@@ -2978,8 +2987,25 @@ def get_crm_options(workspace, user) -> dict:
     }
 
 
-def get_workspace_dashboard_summary(workspace, user) -> dict:
-    """Return role-, visibility-, and pack-aware record counts, pipeline metrics, and recent records."""
+def get_cached_crm_options_bundle(workspace, user) -> dict:
+    """Return cached CRM lookup options with serialized JSON text and ETag, isolated by workspace and caller."""
+    caller_scope = build_caller_cache_scope(user, workspace)
+    return get_or_set_workspace_cache_bundle(
+        workspace.id,
+        domains=(DOMAIN_CATALOG, DOMAIN_LOOKUP_RECORDS, DOMAIN_MEMBERS, DOMAIN_ROLES),
+        key_suffix=f'crm_options:{caller_scope}',
+        scope=f'crm_options:{caller_scope}',
+        loader=lambda: _compute_crm_options(workspace, user),
+    )
+
+
+def get_crm_options(workspace, user) -> dict:
+    """Return workspace assignees, roles, readable Accounts/Contacts summaries, and choice constants."""
+    return dict(get_cached_crm_options_bundle(workspace, user)['payload'])
+
+
+def _compute_workspace_dashboard_summary(workspace, user) -> dict:
+    """Compute role-, visibility-, and pack-aware record counts, pipeline metrics, and recent records."""
     ensure_workspace_catalog(workspace)
     vis_q = build_record_visibility_q(user, workspace)
     enabled_keys = set(
@@ -3143,6 +3169,23 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
         'deal_summary': deal_summary,
         'recent_records': recent_records,
     }
+
+
+def get_cached_dashboard_summary_bundle(workspace, user) -> dict:
+    """Return cached dashboard summary with serialized JSON text and ETag, isolated by workspace and caller."""
+    caller_scope = build_caller_cache_scope(user, workspace)
+    return get_or_set_workspace_cache_bundle(
+        workspace.id,
+        domains=(DOMAIN_CATALOG, DOMAIN_RECORDS, DOMAIN_ROLES),
+        key_suffix=f'dashboard:{caller_scope}',
+        scope=f'dashboard:{caller_scope}',
+        loader=lambda: _compute_workspace_dashboard_summary(workspace, user),
+    )
+
+
+def get_workspace_dashboard_summary(workspace, user) -> dict:
+    """Return role-, visibility-, and pack-aware record counts, pipeline metrics, and recent records."""
+    return dict(get_cached_dashboard_summary_bundle(workspace, user)['payload'])
 
 
 def get_deals_board(
