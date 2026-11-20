@@ -598,6 +598,38 @@ class LeadConversionTests(TestCase):
             content_type="application/json",
         ).json()["record"]
 
+        reuse_preview = staff_client.get(
+            f"/api/v1/workspaces/{ws.slug}/records/lead/{lead2['id']}/conversion-preview/"
+        )
+        self.assertEqual(reuse_preview.status_code, 200)
+        reuse_caps = reuse_preview.json()["capabilities"]
+        self.assertFalse(reuse_caps["can_create_account"])
+        self.assertTrue(reuse_caps["can_reuse_account"])
+        self.assertTrue(reuse_caps["can_convert_lead"])
+
+        # Reusing a standalone Contact requires contact.update
+        standalone_con = owner_client.post(
+            f"/api/v1/workspaces/{ws.slug}/records/contact/",
+            data=json.dumps({"name": "Standalone Kofi"}),
+            content_type="application/json",
+        ).json()["record"]
+        owner_client.patch(
+            f"/api/v1/workspaces/{ws.slug}/roles/{staff_role.id}/",
+            data=json.dumps({"object_rights": {"contact": {"create": False, "read": True, "update": False}}}),
+            content_type="application/json",
+        )
+        standalone_forbidden = staff_client.post(
+            f"/api/v1/workspaces/{ws.slug}/records/lead/{lead2['id']}/convert/",
+            data=json.dumps({"account_id": existing_acc["id"], "contact_id": standalone_con["id"]}),
+            content_type="application/json",
+        )
+        self.assertEqual(standalone_forbidden.status_code, 403)
+        owner_client.patch(
+            f"/api/v1/workspaces/{ws.slug}/roles/{staff_role.id}/",
+            data=json.dumps({"object_rights": {"contact": {"create": True, "read": True, "update": True}}}),
+            content_type="application/json",
+        )
+
         reuse_ok = staff_client.post(
             f"/api/v1/workspaces/{ws.slug}/records/lead/{lead2['id']}/convert/",
             data=json.dumps({"account_id": existing_acc["id"]}),
