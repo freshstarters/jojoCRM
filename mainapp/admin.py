@@ -10,6 +10,8 @@ from .models import (
     Job,
     Lead,
     PasskeyCredential,
+    Pipeline,
+    PipelineStage,
     Role,
     Ticket,
     User,
@@ -32,6 +34,8 @@ admin.site.register(Account)
 admin.site.register(Contact)
 admin.site.register(Lead)
 admin.site.register(Deal)
+admin.site.register(Pipeline)
+admin.site.register(PipelineStage)
 admin.site.register(Job)
 admin.site.register(Appointment)
 admin.site.register(Ticket)

@@ -19,6 +19,8 @@ from .crm import (
     Deal,
     Job,
     Lead,
+    Pipeline,
+    PipelineStage,
     Ticket,
     WorkspaceRecordBase,
 )
@@ -35,6 +37,8 @@ __all__ = [
     'Job',
     'Lead',
     'PasskeyCredential',
+    'Pipeline',
+    'PipelineStage',
     'Role',
     'Ticket',
     'User',

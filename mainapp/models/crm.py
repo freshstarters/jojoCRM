@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django.db import models
+from django.db.models.functions import Lower
 
 
 class WorkspaceRecordBase(models.Model):
@@ -178,12 +179,128 @@ class Lead(WorkspaceRecordBase):
         return f"{self.name} ({self.workspace_id})"
 
 
+class Pipeline(models.Model):
+    """Workspace sales pipeline holding ordered stages for Deal records."""
+
+    DEFAULT_NAME = 'Sales Pipeline'
+
+    workspace = models.ForeignKey(
+        'mainapp.Workspace',
+        on_delete=models.CASCADE,
+        related_name='pipelines',
+    )
+    name = models.CharField(max_length=120, default=DEFAULT_NAME)
+    is_default = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-is_default', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['workspace'],
+                condition=models.Q(is_default=True),
+                name='unique_default_pipeline_per_workspace',
+            ),
+            models.UniqueConstraint(
+                Lower('name'),
+                'workspace',
+                name='unique_pipeline_name_ci_per_workspace',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.workspace_id})"
+
+
+class PipelineStage(models.Model):
+    """Ordered stage belonging to a workspace Pipeline."""
+
+    TONE_NEUTRAL = 'neutral'
+    TONE_INFO = 'info'
+    TONE_INDIGO = 'indigo'
+    TONE_VIOLET = 'violet'
+    TONE_TEAL = 'teal'
+    TONE_SUCCESS = 'success'
+    TONE_WARN = 'warn'
+    TONE_ORANGE = 'orange'
+    TONE_DANGER = 'danger'
+    TONE_PINK = 'pink'
+
+    TONE_CHOICES = [
+        (TONE_NEUTRAL, 'Slate (Neutral)'),
+        (TONE_INFO, 'Blue (Info)'),
+        (TONE_INDIGO, 'Indigo'),
+        (TONE_VIOLET, 'Violet'),
+        (TONE_TEAL, 'Teal'),
+        (TONE_SUCCESS, 'Emerald (Success)'),
+        (TONE_WARN, 'Amber (Warm)'),
+        (TONE_ORANGE, 'Orange'),
+        (TONE_DANGER, 'Rose (Danger)'),
+        (TONE_PINK, 'Pink'),
+    ]
+
+    STARTER_STAGE_SPECS = (
+        ('New', TONE_NEUTRAL),
+        ('Qualified', TONE_INFO),
+        ('Proposal', TONE_WARN),
+        ('Won', TONE_SUCCESS),
+        ('Lost', TONE_DANGER),
+    )
+
+    pipeline = models.ForeignKey(
+        Pipeline,
+        on_delete=models.CASCADE,
+        related_name='stages',
+    )
+    workspace = models.ForeignKey(
+        'mainapp.Workspace',
+        on_delete=models.CASCADE,
+        related_name='pipeline_stages',
+    )
+    name = models.CharField(max_length=100)
+    position = models.PositiveIntegerField()
+    tone = models.CharField(max_length=20, choices=TONE_CHOICES, default=TONE_INFO)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['position', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                Lower('name'),
+                'pipeline',
+                name='unique_stage_name_ci_per_pipeline',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['pipeline', 'position'], name='pipestage_pipe_pos_idx'),
+        ]
+
+    def __str__(self):
+        return f"{self.position}. {self.name} ({self.pipeline_id})"
+
+
 class Deal(WorkspaceRecordBase):
     """Pack sales opportunity positioned on a pipeline stage."""
 
     OBJECT_KEY = 'deal'
     DEFAULT_STAGES = ('New', 'Qualified', 'Proposal', 'Won', 'Lost')
 
+    pipeline = models.ForeignKey(
+        Pipeline,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='deals',
+    )
+    pipeline_stage = models.ForeignKey(
+        PipelineStage,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='deals',
+    )
     title = models.CharField(max_length=255)
     account = models.ForeignKey(
         Account,

@@ -253,6 +253,13 @@ class WorkspaceInvite(models.Model):
         related_name='invites',
     )
     email = models.EmailField()
+    role = models.ForeignKey(
+        'mainapp.Role',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='invites',
+    )
     invited_by = models.ForeignKey(
         User,
         null=True,
