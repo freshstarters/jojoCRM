@@ -8,7 +8,6 @@ from django.utils import timezone
 from .audit_service import record_audit_event
 from .crm_service import (
     RECORD_CODE_PREFIXES,
-    CrmDomainError,
     _build_base_queryset,
     _first_present,
     _get_contact_screen_label,
@@ -20,13 +19,19 @@ from .crm_service import (
     _parse_optional_date,
     _parse_optional_str,
     _parse_required_str,
-    _validate_choice,
     ensure_object_permission,
     ensure_object_table_enabled,
     get_lead_conversion_capability,
     get_record_label,
     serialize_crm_record,
 )
+from .pipeline_service import (
+    get_ordered_pipeline_stages,
+    resolve_deal_stage,
+    serialize_pipeline_stage,
+)
+from .role_service import build_record_visibility_q, user_can_see_record
+from ..helpers.crm_errors import CrmDomainError
 from ..catalog import OBJECTS_BY_KEY
 from ..models import (
     Account,
@@ -82,9 +87,15 @@ def _find_account_matches(workspace, user, lead: Lead) -> list[dict]:
     if email_norm:
         query |= Q(email__iexact=email_norm)
 
+    vis_q = build_record_visibility_q(user, workspace)
     phone_ids: list[int] = []
     if phone_norm:
-        for acc_id, acc_phone in Account.objects.filter(workspace=workspace).exclude(phone='').values_list('id', 'phone'):
+        for acc_id, acc_phone in (
+            Account.objects.filter(workspace=workspace)
+            .filter(vis_q)
+            .exclude(phone='')
+            .values_list('id', 'phone')
+        ):
             if _normalize_phone(acc_phone) == phone_norm:
                 phone_ids.append(acc_id)
         if phone_ids:
@@ -94,7 +105,12 @@ def _find_account_matches(workspace, user, lead: Lead) -> list[dict]:
         return []
 
     matches: list[dict] = []
-    for account in Account.objects.filter(workspace=workspace).filter(query).order_by('-updated_at', 'id'):
+    for account in (
+        Account.objects.filter(workspace=workspace)
+        .filter(vis_q)
+        .filter(query)
+        .order_by('-updated_at', 'id')
+    ):
         reasons: list[str] = []
         if company_norm and _normalize_text(account.name) == company_norm:
             reasons.append('Company name')
@@ -136,9 +152,15 @@ def _find_contact_matches(workspace, user, lead: Lead) -> list[dict]:
     if name_norm:
         query |= Q(name__iexact=lead.name.strip())
 
+    vis_q = build_record_visibility_q(user, workspace)
     phone_ids: list[int] = []
     if phone_norm:
-        for con_id, con_phone in Contact.objects.filter(workspace=workspace).exclude(phone='').values_list('id', 'phone'):
+        for con_id, con_phone in (
+            Contact.objects.filter(workspace=workspace)
+            .filter(vis_q)
+            .exclude(phone='')
+            .values_list('id', 'phone')
+        ):
             if _normalize_phone(con_phone) == phone_norm:
                 phone_ids.append(con_id)
         if phone_ids:
@@ -151,6 +173,7 @@ def _find_contact_matches(workspace, user, lead: Lead) -> list[dict]:
     contacts = (
         Contact.objects.select_related('account')
         .filter(workspace=workspace)
+        .filter(vis_q)
         .filter(query)
         .order_by('-updated_at', 'id')
     )
@@ -194,25 +217,33 @@ def get_lead_conversion_preview(workspace, user, lead_id: int) -> dict:
     _ensure_conversion_tables_enabled(workspace)
     ensure_object_permission(user, workspace, 'lead', 'read')
 
-    lead = _build_base_queryset(workspace, 'lead').filter(id=lead_id).first()
+    lead = _build_base_queryset(workspace, 'lead', user=user).filter(id=lead_id).first()
     if lead is None:
         raise CrmDomainError(f'{OBJECTS_BY_KEY["lead"].label} not found.', status_code=404)
 
     default_account_name = (lead.company or '').strip() or lead.name
     capability = get_lead_conversion_capability(user, workspace)
+    stages = get_ordered_pipeline_stages(workspace, require_enabled=True)
+    default_stage = resolve_deal_stage(
+        workspace,
+        None,
+        allow_default=True,
+        prefer_qualified=True,
+    )
 
     return {
-        'lead': serialize_crm_record(lead, 'lead', workspace=workspace),
+        'lead': serialize_crm_record(lead, 'lead', user=user, workspace=workspace),
         'already_converted': lead.status == Lead.STATUS_CONVERTED or lead.converted_at is not None,
         'account_matches': _find_account_matches(workspace, user, lead),
         'contact_matches': _find_contact_matches(workspace, user, lead),
+        'deal_stages': [serialize_pipeline_stage(stage) for stage in stages],
         'defaults': {
             'account_name': default_account_name,
             'account_city': '',
             'contact_name': lead.name,
             'contact_title': '',
             'deal_title': f'{default_account_name} Deal',
-            'deal_stage': 'Qualified',
+            'deal_stage': default_stage.name,
             'deal_amount': '0.00',
             'target_close_date': None,
             'win_probability': None,
@@ -239,7 +270,11 @@ def _resolve_conversion_account(
     account_id = _parse_fk_id(raw_account_id, field_name='Account')
     if account_id is not None:
         ensure_object_permission(user, workspace, 'account', 'read')
-        account = Account.objects.filter(workspace=workspace, id=account_id).first()
+        account = (
+            Account.objects.filter(workspace=workspace, id=account_id)
+            .filter(build_record_visibility_q(user, workspace))
+            .first()
+        )
         if account is None:
             raise CrmDomainError('Selected Account was not found in this workspace.', status_code=400)
         return account, False
@@ -292,6 +327,7 @@ def _resolve_conversion_contact(
         contact = (
             Contact.objects.select_related('account')
             .filter(workspace=workspace, id=contact_id)
+            .filter(build_record_visibility_q(user, workspace))
             .first()
         )
         if contact is None:
@@ -400,8 +436,10 @@ def _record_conversion_notes(
     for target_type, target_id, summary in notes:
         Activity.objects.create(
             workspace=workspace,
-            owner=user,
+            owner=lead.owner or user,
             created_by=user,
+            visibility=lead.visibility,
+            shared_role=lead.shared_role,
             activity_type=Activity.TYPE_NOTE,
             target_object_type=target_type,
             target_object_id=target_id,
@@ -521,7 +559,7 @@ def convert_lead_record(
             .filter(workspace=workspace, id=lead_id)
             .first()
         )
-        if lead is None:
+        if lead is None or not user_can_see_record(user, workspace, lead):
             raise CrmDomainError(f'{OBJECTS_BY_KEY["lead"].label} not found.', status_code=404)
 
         if lead.status == Lead.STATUS_CONVERTED or lead.converted_at is not None:
@@ -546,10 +584,12 @@ def convert_lead_record(
             fallback=f'{account.name} Deal',
             label='Deal title',
         )
-        deal_stage = _validate_choice(
-            _first_present(data, 'deal_stage', 'stage', default='Qualified'),
-            Deal.DEFAULT_STAGES,
-            field_name='Stage',
+        stage_obj = resolve_deal_stage(
+            workspace,
+            _first_present(data, 'deal_stage', 'stage'),
+            stage_id=_first_present(data, 'deal_stage_id', 'stage_id', 'pipeline_stage_id'),
+            allow_default=True,
+            prefer_qualified=True,
         )
         deal_amount = _parse_decimal(
             _first_present(data, 'deal_amount', 'amount'),
@@ -575,11 +615,13 @@ def convert_lead_record(
             created_by=user,
             visibility=lead.visibility,
             shared_role=lead.shared_role,
+            pipeline=stage_obj.pipeline,
+            pipeline_stage=stage_obj,
             title=deal_title,
             account=account,
             contact=contact,
             amount=deal_amount,
-            stage=deal_stage,
+            stage=stage_obj.name,
             target_close_date=target_close_date,
             win_probability=win_probability,
             notes=lead.notes,
