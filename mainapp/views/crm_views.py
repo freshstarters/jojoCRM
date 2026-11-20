@@ -8,6 +8,12 @@ from ..helpers.request_helpers import (
     require_workspace_member,
 )
 from ..models import Activity
+from ..service.audit_service import (
+    AuditQueryError,
+    DEFAULT_RECORD_AUDIT_PAGE_SIZE,
+    MAX_RECORD_AUDIT_PAGE_SIZE,
+    list_record_audit_entries,
+)
 from ..service.crm_service import (
     CRM_MODELS_BY_KEY,
     DEFAULT_BOARD_PER_STAGE_LIMIT,
@@ -207,6 +213,45 @@ def workspace_record_activities_view(request, slug: str, object_key: str, record
         result = create_crm_record(workspace, user, 'activity', merged_payload)
         return JsonResponse(result, status=201)
     except CrmDomainError as exc:
+        return JsonResponse({'error': exc.message}, status=exc.status_code)
+
+
+@require_GET
+def workspace_record_audit_view(request, slug: str, object_key: str, record_id: int):
+    """Return paginated, S2.4-scoped audit change history for a single workspace CRM record."""
+    user, workspace, error_response = require_workspace_member(request, slug)
+    if error_response is not None:
+        return error_response
+
+    page, page_error = parse_positive_int(
+        request.GET.get('page'), default=1, name='page'
+    )
+    if page_error is not None:
+        return page_error
+
+    page_size, size_error = parse_positive_int(
+        request.GET.get('page_size'),
+        default=DEFAULT_RECORD_AUDIT_PAGE_SIZE,
+        name='page_size',
+        maximum=MAX_RECORD_AUDIT_PAGE_SIZE,
+    )
+    if size_error is not None:
+        return size_error
+
+    try:
+        payload = list_record_audit_entries(
+            workspace,
+            user,
+            object_key,
+            record_id,
+            page=page,
+            page_size=page_size,
+            actor_kind=request.GET.get('actor_kind') or '',
+            action=request.GET.get('action') or '',
+            q=request.GET.get('q') or '',
+        )
+        return JsonResponse(payload, status=200)
+    except (CrmDomainError, AuditQueryError) as exc:
         return JsonResponse({'error': exc.message}, status=exc.status_code)
 
 

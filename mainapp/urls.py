@@ -23,9 +23,11 @@ from .views.crm_views import (
     workspace_lead_conversion_preview_view,
     workspace_lead_convert_view,
     workspace_record_activities_view,
+    workspace_record_audit_view,
     workspace_record_collection_view,
     workspace_record_detail_view,
 )
+from .views.search_views import workspace_search_view
 from .views.pipeline_views import (
     workspace_pipeline_stage_detail_view,
     workspace_pipeline_stages_reorder_view,
@@ -172,6 +174,7 @@ urlpatterns = [
         name='workspace_role_detail',
     ),
     path('workspaces/<slug:slug>/dashboard/', workspace_dashboard_view, name='workspace_dashboard'),
+    path('workspaces/<slug:slug>/search/', workspace_search_view, name='workspace_search'),
     path('workspaces/<slug:slug>/crm/options/', workspace_crm_options_view, name='workspace_crm_options'),
     path('workspaces/<slug:slug>/deals/board/', workspace_deals_board_view, name='workspace_deals_board'),
     path('workspaces/<slug:slug>/pipelines/', workspace_pipelines_view, name='workspace_pipelines'),
@@ -204,6 +207,11 @@ urlpatterns = [
         'workspaces/<slug:slug>/records/<str:object_key>/<int:record_id>/activities/',
         workspace_record_activities_view,
         name='workspace_record_activities',
+    ),
+    path(
+        'workspaces/<slug:slug>/records/<str:object_key>/<int:record_id>/audit/',
+        workspace_record_audit_view,
+        name='workspace_record_audit',
     ),
     path(
         'workspaces/<slug:slug>/records/lead/<int:record_id>/conversion-preview/',
