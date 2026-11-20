@@ -219,6 +219,7 @@ def send_workspace_invite_email(
     invited_by,
     email: str,
     *,
+    role=None,
     enforce_cooldown: bool = True,
 ) -> tuple[WorkspaceInvite, str]:
     """Create or rotate an active workspace invite and deliver the invite email."""
@@ -246,7 +247,8 @@ def send_workspace_invite_email(
     expires_at = now + ttl
 
     invite = (
-        WorkspaceInvite.objects.select_for_update()
+        WorkspaceInvite.objects.select_for_update(of=("self",))
+        .select_related("role")
         .filter(
             workspace=workspace,
             email__iexact=normalized_email,
@@ -257,8 +259,11 @@ def send_workspace_invite_email(
     )
     if invite is not None:
         prev_status = invite.current_status(now=now).capitalize()
+        prev_role_name = invite.role.name if invite.role is not None else "Staff"
         invite.email = normalized_email
         invite.invited_by = invited_by
+        if role is not None:
+            invite.role = role
         invite.token_hash = token_digest
         invite.last_sent_at = now
         invite.expires_at = expires_at
@@ -266,6 +271,7 @@ def send_workspace_invite_email(
             update_fields=[
                 "email",
                 "invited_by",
+                "role",
                 "token_hash",
                 "last_sent_at",
                 "expires_at",
@@ -273,16 +279,19 @@ def send_workspace_invite_email(
             ]
         )
         invite._audit_prev_status = prev_status
+        invite._audit_prev_role_name = prev_role_name
     else:
         invite = WorkspaceInvite.objects.create(
             workspace=workspace,
             email=normalized_email,
+            role=role,
             invited_by=invited_by,
             token_hash=token_digest,
             last_sent_at=now,
             expires_at=expires_at,
         )
         invite._audit_prev_status = None
+        invite._audit_prev_role_name = None
 
     invite_url = _build_app_url("/accept-invite", raw_token)
     inviter_email = getattr(invited_by, "email", "a workspace administrator")
