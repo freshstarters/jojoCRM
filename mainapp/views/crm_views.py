@@ -1,6 +1,7 @@
 from django.http import JsonResponse
 from django.views.decorators.http import require_GET, require_http_methods
 
+from ..helpers.crm_errors import CrmDomainError
 from ..helpers.request_helpers import (
     parse_json_object,
     parse_positive_int,
@@ -9,14 +10,15 @@ from ..helpers.request_helpers import (
 from ..models import Activity
 from ..service.crm_service import (
     CRM_MODELS_BY_KEY,
+    DEFAULT_BOARD_PER_STAGE_LIMIT,
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
-    CrmDomainError,
     create_crm_record,
     delete_crm_record,
     ensure_object_permission,
     get_crm_options,
     get_crm_record_detail,
+    get_deals_board,
     get_workspace_dashboard_summary,
     list_crm_records,
     resolve_object_key,
@@ -26,6 +28,7 @@ from ..service.lead_conversion_service import (
     convert_lead_record,
     get_lead_conversion_preview,
 )
+from ..service.role_service import build_record_visibility_q
 
 
 @require_GET
@@ -44,6 +47,34 @@ def workspace_crm_options_view(request, slug: str):
     if error_response is not None:
         return error_response
     return JsonResponse(get_crm_options(workspace, user), status=200)
+
+
+@require_GET
+def workspace_deals_board_view(request, slug: str):
+    """Return ordered pipeline columns with per-stage bounded Deal slices and SQL totals."""
+    user, workspace, error_response = require_workspace_member(request, slug)
+    if error_response is not None:
+        return error_response
+
+    per_stage_limit, limit_error = parse_positive_int(
+        request.GET.get('per_stage_limit'),
+        default=DEFAULT_BOARD_PER_STAGE_LIMIT,
+        name='per_stage_limit',
+        maximum=200,
+    )
+    if limit_error is not None:
+        return limit_error
+
+    try:
+        result = get_deals_board(
+            workspace,
+            user,
+            query_params=request.GET,
+            per_stage_limit=per_stage_limit,
+        )
+        return JsonResponse(result, status=200)
+    except CrmDomainError as exc:
+        return JsonResponse({'error': exc.message}, status=exc.status_code)
 
 
 @require_http_methods(['GET', 'POST'])
@@ -130,7 +161,11 @@ def workspace_record_activities_view(request, slug: str, object_key: str, record
 
         ensure_object_permission(user, workspace, target_key, 'read')
         target_model = CRM_MODELS_BY_KEY[target_key]
-        if not target_model.objects.filter(workspace=workspace, id=record_id).exists():
+        if (
+            not target_model.objects.filter(workspace=workspace, id=record_id)
+            .filter(build_record_visibility_q(user, workspace))
+            .exists()
+        ):
             return JsonResponse({'error': 'Target record not found.'}, status=404)
 
         if request.method == 'GET':

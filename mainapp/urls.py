@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views.account_views import (
     account_password_change_view,
+    account_password_set_view,
     account_profile_view,
     auth_methods_view,
 )
@@ -18,11 +19,18 @@ from .views.auth_views import (
 from .views.crm_views import (
     workspace_crm_options_view,
     workspace_dashboard_view,
+    workspace_deals_board_view,
     workspace_lead_conversion_preview_view,
     workspace_lead_convert_view,
     workspace_record_activities_view,
     workspace_record_collection_view,
     workspace_record_detail_view,
+)
+from .views.pipeline_views import (
+    workspace_pipeline_stage_detail_view,
+    workspace_pipeline_stages_reorder_view,
+    workspace_pipeline_stages_view,
+    workspace_pipelines_view,
 )
 from .views.invite_views import (
     invite_accept_view,
@@ -98,6 +106,11 @@ urlpatterns = [
         account_password_change_view,
         name='account_password_change',
     ),
+    path(
+        'account/password/set/',
+        account_password_set_view,
+        name='account_password_set',
+    ),
     path('invites/preview/', invite_preview_view, name='invite_preview'),
     path('invites/accept/', invite_accept_view, name='invite_accept'),
     path('auth/google/start/', google_oauth_start_view, name='google_oauth_start'),
@@ -160,6 +173,23 @@ urlpatterns = [
     ),
     path('workspaces/<slug:slug>/dashboard/', workspace_dashboard_view, name='workspace_dashboard'),
     path('workspaces/<slug:slug>/crm/options/', workspace_crm_options_view, name='workspace_crm_options'),
+    path('workspaces/<slug:slug>/deals/board/', workspace_deals_board_view, name='workspace_deals_board'),
+    path('workspaces/<slug:slug>/pipelines/', workspace_pipelines_view, name='workspace_pipelines'),
+    path(
+        'workspaces/<slug:slug>/pipelines/stages/',
+        workspace_pipeline_stages_view,
+        name='workspace_pipeline_stages',
+    ),
+    path(
+        'workspaces/<slug:slug>/pipelines/stages/reorder/',
+        workspace_pipeline_stages_reorder_view,
+        name='workspace_pipeline_stages_reorder',
+    ),
+    path(
+        'workspaces/<slug:slug>/pipelines/stages/<int:stage_id>/',
+        workspace_pipeline_stage_detail_view,
+        name='workspace_pipeline_stage_detail',
+    ),
     path(
         'workspaces/<slug:slug>/records/<str:object_key>/',
         workspace_record_collection_view,
