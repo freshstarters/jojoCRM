@@ -12,6 +12,7 @@ from ..models import (
     Contact,
     Deal,
     Job,
+    Lead,
     PasskeyCredential,
     Role,
     User,
@@ -601,3 +602,128 @@ class S24RolesAndSharingTests(TestCase):
             content_type='application/json',
         )
         self.assertEqual(cross_rename.status_code, 404)
+
+    def test_lead_conversion_enforces_field_rights_on_preview_and_convert(self):
+        ws, owner, _owner_role, staff_role, staff_user, _staff_b = self._create_workspace_and_users(
+            slug='kora-s24-conv-fr'
+        )
+        owner_client = self._logged_in_client(owner)
+
+        # Clone Staff and restrict fields across Account, Contact, and Deal
+        clone_res = owner_client.post(
+            f'/api/v1/workspaces/{ws.slug}/roles/',
+            data=json.dumps({'name': 'Restricted Converter', 'source_role_id': staff_role.id}),
+            content_type='application/json',
+        )
+        self.assertEqual(clone_res.status_code, 201)
+        restricted_role_id = clone_res.json()['role']['id']
+
+        patch_res = owner_client.patch(
+            f'/api/v1/workspaces/{ws.slug}/roles/{restricted_role_id}/',
+            data=json.dumps({
+                'field_rights': {
+                    'account': {'email': 'hidden', 'city': 'read_only'},
+                    'contact': {'phone': 'hidden', 'title': 'read_only', 'account': 'read_only'},
+                    'deal': {'amount': 'hidden', 'win_probability': 'read_only'},
+                }
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(patch_res.status_code, 200)
+
+        staff_user.role = Role.objects.get(id=restricted_role_id)
+        staff_user.save(update_fields=['role'])
+
+        existing_acc = Account.objects.create(
+            workspace=ws,
+            owner=owner,
+            name='Volta Metals Ltd',
+            city='Tema',
+            email='secret@voltametals.gh',
+            phone='+233200001111',
+        )
+        standalone_contact = Contact.objects.create(
+            workspace=ws,
+            owner=owner,
+            name='Kwame Mensah',
+            title='Director',
+            email='kwame@voltametals.gh',
+            phone='+233244998877',
+        )
+        lead = Lead.objects.create(
+            workspace=ws,
+            owner=staff_user,
+            name='Kwame Mensah',
+            company='Volta Metals Ltd',
+            email='secret@voltametals.gh',
+            phone='+233244998877',
+        )
+
+        staff_client = self._logged_in_client(staff_user)
+
+        # Preview strips hidden Account/Contact fields and never matches on hidden fields
+        prev_res = staff_client.get(
+            f'/api/v1/workspaces/{ws.slug}/records/lead/{lead.id}/conversion-preview/'
+        )
+        self.assertEqual(prev_res.status_code, 200)
+        prev_data = prev_res.json()
+
+        self.assertEqual(prev_data['field_rights']['deal']['amount'], 'hidden')
+        self.assertNotIn('deal_amount', prev_data['defaults'])
+        self.assertFalse(prev_data['capabilities']['can_link_standalone_contact'])
+
+        acc_matches = prev_data['account_matches']
+        self.assertEqual(len(acc_matches), 1)
+        self.assertEqual(acc_matches[0]['id'], existing_acc.id)
+        self.assertNotIn('email', acc_matches[0])
+        self.assertNotIn('Email', acc_matches[0]['match_reasons'])
+        self.assertIn('Company name', acc_matches[0]['match_reasons'])
+
+        con_matches = prev_data['contact_matches']
+        self.assertEqual(len(con_matches), 1)
+        self.assertEqual(con_matches[0]['id'], standalone_contact.id)
+        self.assertNotIn('phone', con_matches[0])
+        self.assertNotIn('Phone', con_matches[0]['match_reasons'])
+        self.assertIn('Name', con_matches[0]['match_reasons'])
+
+        # Passing hidden/read-only field overrides is rejected with 403
+        blocked_amount = staff_client.post(
+            f'/api/v1/workspaces/{ws.slug}/records/lead/{lead.id}/convert/',
+            data=json.dumps({'deal_amount': '9999.00'}),
+            content_type='application/json',
+        )
+        self.assertEqual(blocked_amount.status_code, 403)
+
+        blocked_city = staff_client.post(
+            f'/api/v1/workspaces/{ws.slug}/records/lead/{lead.id}/convert/',
+            data=json.dumps({'account_city': 'Kumasi'}),
+            content_type='application/json',
+        )
+        self.assertEqual(blocked_city.status_code, 403)
+
+        # Linking a standalone Contact is blocked (403) when contact.account is read_only
+        blocked_standalone_link = staff_client.post(
+            f'/api/v1/workspaces/{ws.slug}/records/lead/{lead.id}/convert/',
+            data=json.dumps({
+                'account_id': existing_acc.id,
+                'contact_id': standalone_contact.id,
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(blocked_standalone_link.status_code, 403)
+
+        # Omitting non-writable fields succeeds using safe defaults and strips hidden fields on response
+        ok_res = staff_client.post(
+            f'/api/v1/workspaces/{ws.slug}/records/lead/{lead.id}/convert/',
+            data=json.dumps({
+                'account_name': 'Volta Metals New',
+                'contact_name': 'Kwame Mensah',
+                'deal_title': 'Volta Metals Retainer',
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(ok_res.status_code, 200)
+        ok_body = ok_res.json()
+        self.assertNotIn('amount', ok_body['deal'])
+        self.assertNotIn('email', ok_body['account'])
+        self.assertNotIn('phone', ok_body['contact'])

@@ -11,8 +11,10 @@ from .crm_service import (
     _build_base_queryset,
     _first_present,
     _get_contact_screen_label,
+    _get_visible_record_label,
     _has_any_key,
     _is_enabled_and_readable,
+    _is_field_visible,
     _parse_decimal,
     _parse_fk_id,
     _parse_int_range,
@@ -30,7 +32,15 @@ from .pipeline_service import (
     resolve_deal_stage,
     serialize_pipeline_stage,
 )
-from .role_service import build_record_visibility_q, user_can_see_record
+from .role_service import (
+    FIELD_RIGHT_EDITABLE,
+    FIELD_RIGHT_HIDDEN,
+    OBJECT_FIELD_SCHEMAS,
+    build_record_visibility_q,
+    get_user_field_rights,
+    is_workspace_owner,
+    user_can_see_record,
+)
 from ..helpers.crm_errors import CrmDomainError
 from ..catalog import OBJECTS_BY_KEY
 from ..models import (
@@ -71,13 +81,56 @@ def _ensure_conversion_tables_enabled(workspace) -> None:
     ensure_object_table_enabled(workspace, 'contact')
 
 
+def _ensure_conversion_writable_overrides(
+    user,
+    workspace,
+    object_key: str,
+    payload: dict,
+    field_key_map: dict[str, tuple[str, ...]],
+) -> None:
+    """Reject explicit lead-conversion overrides for fields marked hidden or read-only."""
+    if is_workspace_owner(user, workspace):
+        return
+    field_rights = get_user_field_rights(user, workspace, object_key)
+    schema_by_key = {s.key: s for s in OBJECT_FIELD_SCHEMAS.get(object_key, ())}
+    contact_label = _get_contact_screen_label(workspace)
+    for field_key, payload_keys in field_key_map.items():
+        level = field_rights.get(field_key, FIELD_RIGHT_EDITABLE)
+        if level == FIELD_RIGHT_EDITABLE:
+            continue
+        if any(k in payload for k in payload_keys):
+            schema = schema_by_key.get(field_key)
+            if schema is not None:
+                label = contact_label if schema.uses_contact_label else schema.label
+            else:
+                label = field_key.replace('_', ' ').title()
+            level_label = 'hidden' if level == FIELD_RIGHT_HIDDEN else 'read-only'
+            raise CrmDomainError(
+                f'Your role cannot modify {label} because this field is {level_label}.',
+                status_code=403,
+            )
+
+
 def _find_account_matches(workspace, user, lead: Lead) -> list[dict]:
     if not _is_enabled_and_readable(user, workspace, 'account'):
         return []
 
-    company_norm = _normalize_text(lead.company)
-    email_norm = _normalize_text(lead.email)
-    phone_norm = _normalize_phone(lead.phone)
+    can_match_company = (
+        _is_field_visible(user, workspace, 'lead', 'company')
+        and _is_field_visible(user, workspace, 'account', 'name')
+    )
+    can_match_email = (
+        _is_field_visible(user, workspace, 'lead', 'email')
+        and _is_field_visible(user, workspace, 'account', 'email')
+    )
+    can_match_phone = (
+        _is_field_visible(user, workspace, 'lead', 'phone')
+        and _is_field_visible(user, workspace, 'account', 'phone')
+    )
+
+    company_norm = _normalize_text(lead.company) if can_match_company else ''
+    email_norm = _normalize_text(lead.email) if can_match_email else ''
+    phone_norm = _normalize_phone(lead.phone) if can_match_phone else ''
     if not company_norm and not email_norm and not phone_norm:
         return []
 
@@ -104,6 +157,10 @@ def _find_account_matches(workspace, user, lead: Lead) -> list[dict]:
     if not query:
         return []
 
+    city_visible = _is_field_visible(user, workspace, 'account', 'city')
+    email_visible = _is_field_visible(user, workspace, 'account', 'email')
+    phone_visible = _is_field_visible(user, workspace, 'account', 'phone')
+
     matches: list[dict] = []
     for account in (
         Account.objects.filter(workspace=workspace)
@@ -120,17 +177,19 @@ def _find_account_matches(workspace, user, lead: Lead) -> list[dict]:
             reasons.append('Phone')
         if not reasons:
             continue
-        matches.append(
-            {
-                'id': account.id,
-                'record_code': f'{RECORD_CODE_PREFIXES["account"]}-{account.id}',
-                'name': account.name,
-                'city': account.city,
-                'email': account.email,
-                'phone': account.phone,
-                'match_reasons': reasons,
-            }
-        )
+        item = {
+            'id': account.id,
+            'record_code': f'{RECORD_CODE_PREFIXES["account"]}-{account.id}',
+            'name': _get_visible_record_label(account, 'account', user=user, workspace=workspace),
+            'match_reasons': reasons,
+        }
+        if city_visible:
+            item['city'] = account.city
+        if email_visible:
+            item['email'] = account.email
+        if phone_visible:
+            item['phone'] = account.phone
+        matches.append(item)
 
     matches.sort(key=lambda item: (-len(item['match_reasons']), item['name'].lower(), item['id']))
     return matches[:MAX_MATCH_RESULTS]
@@ -140,9 +199,22 @@ def _find_contact_matches(workspace, user, lead: Lead) -> list[dict]:
     if not _is_enabled_and_readable(user, workspace, 'contact'):
         return []
 
-    name_norm = _normalize_text(lead.name)
-    email_norm = _normalize_text(lead.email)
-    phone_norm = _normalize_phone(lead.phone)
+    can_match_name = (
+        _is_field_visible(user, workspace, 'lead', 'name')
+        and _is_field_visible(user, workspace, 'contact', 'name')
+    )
+    can_match_email = (
+        _is_field_visible(user, workspace, 'lead', 'email')
+        and _is_field_visible(user, workspace, 'contact', 'email')
+    )
+    can_match_phone = (
+        _is_field_visible(user, workspace, 'lead', 'phone')
+        and _is_field_visible(user, workspace, 'contact', 'phone')
+    )
+
+    name_norm = _normalize_text(lead.name) if can_match_name else ''
+    email_norm = _normalize_text(lead.email) if can_match_email else ''
+    phone_norm = _normalize_phone(lead.phone) if can_match_phone else ''
     if not name_norm and not email_norm and not phone_norm:
         return []
 
@@ -169,6 +241,12 @@ def _find_contact_matches(workspace, user, lead: Lead) -> list[dict]:
     if not query:
         return []
 
+    title_visible = _is_field_visible(user, workspace, 'contact', 'title')
+    email_visible = _is_field_visible(user, workspace, 'contact', 'email')
+    phone_visible = _is_field_visible(user, workspace, 'contact', 'phone')
+    contact_account_visible = _is_field_visible(user, workspace, 'contact', 'account')
+    can_read_account = _is_enabled_and_readable(user, workspace, 'account')
+
     matches: list[dict] = []
     contacts = (
         Contact.objects.select_related('account')
@@ -187,19 +265,33 @@ def _find_contact_matches(workspace, user, lead: Lead) -> list[dict]:
             reasons.append('Name')
         if not reasons:
             continue
-        matches.append(
-            {
-                'id': contact.id,
-                'record_code': f'{RECORD_CODE_PREFIXES["contact"]}-{contact.id}',
-                'name': contact.name,
-                'title': contact.title,
-                'email': contact.email,
-                'phone': contact.phone,
-                'account_id': contact.account_id,
-                'account_name': contact.account.name if contact.account else '',
-                'match_reasons': reasons,
-            }
-        )
+        item = {
+            'id': contact.id,
+            'record_code': f'{RECORD_CODE_PREFIXES["contact"]}-{contact.id}',
+            'name': _get_visible_record_label(contact, 'contact', user=user, workspace=workspace),
+            'match_reasons': reasons,
+        }
+        if title_visible:
+            item['title'] = contact.title
+        if email_visible:
+            item['email'] = contact.email
+        if phone_visible:
+            item['phone'] = contact.phone
+        if contact_account_visible:
+            if (
+                contact.account_id
+                and contact.account is not None
+                and can_read_account
+                and user_can_see_record(user, workspace, contact.account)
+            ):
+                item['account_id'] = contact.account_id
+                item['account_name'] = _get_visible_record_label(
+                    contact.account, 'account', user=user, workspace=workspace
+                )
+            else:
+                item['account_id'] = None
+                item['account_name'] = ''
+        matches.append(item)
 
     matches.sort(
         key=lambda item: (
@@ -213,7 +305,7 @@ def _find_contact_matches(workspace, user, lead: Lead) -> list[dict]:
 
 
 def get_lead_conversion_preview(workspace, user, lead_id: int) -> dict:
-    """Return matching existing Accounts/Contacts, defaults, and permissions for converting a Lead."""
+    """Return matching existing Accounts/Contacts, defaults, field rights, and permissions for converting a Lead."""
     _ensure_conversion_tables_enabled(workspace)
     ensure_object_permission(user, workspace, 'lead', 'read')
 
@@ -221,8 +313,26 @@ def get_lead_conversion_preview(workspace, user, lead_id: int) -> dict:
     if lead is None:
         raise CrmDomainError(f'{OBJECTS_BY_KEY["lead"].label} not found.', status_code=404)
 
-    default_account_name = (lead.company or '').strip() or lead.name
+    visible_lead_company = (
+        (lead.company or '').strip()
+        if _is_field_visible(user, workspace, 'lead', 'company')
+        else ''
+    )
+    visible_lead_name = _get_visible_record_label(lead, 'lead', user=user, workspace=workspace)
+    default_account_name = visible_lead_company or visible_lead_name
     capability = get_lead_conversion_capability(user, workspace)
+    account_field_rights = get_user_field_rights(user, workspace, 'account')
+    contact_field_rights = get_user_field_rights(user, workspace, 'contact')
+    deal_field_rights = get_user_field_rights(user, workspace, 'deal')
+    capability = {
+        **capability,
+        'can_link_standalone_contact': bool(capability.get('can_update_contact'))
+        and (
+            is_workspace_owner(user, workspace)
+            or contact_field_rights.get('account', FIELD_RIGHT_EDITABLE) == FIELD_RIGHT_EDITABLE
+        ),
+    }
+
     stages = get_ordered_pipeline_stages(workspace, require_enabled=True)
     default_stage = resolve_deal_stage(
         workspace,
@@ -231,24 +341,43 @@ def get_lead_conversion_preview(workspace, user, lead_id: int) -> dict:
         prefer_qualified=True,
     )
 
+    defaults: dict = {}
+    if account_field_rights.get('name', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN:
+        defaults['account_name'] = default_account_name
+    if account_field_rights.get('city', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN:
+        defaults['account_city'] = ''
+    if contact_field_rights.get('name', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN:
+        defaults['contact_name'] = visible_lead_name
+    if contact_field_rights.get('title', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN:
+        defaults['contact_title'] = ''
+    if deal_field_rights.get('title', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN:
+        defaults['deal_title'] = f'{default_account_name} Deal'
+    if deal_field_rights.get('stage', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN:
+        defaults['deal_stage'] = default_stage.name
+    if deal_field_rights.get('amount', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN:
+        defaults['deal_amount'] = '0.00'
+    if deal_field_rights.get('target_close_date', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN:
+        defaults['target_close_date'] = None
+    if deal_field_rights.get('win_probability', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN:
+        defaults['win_probability'] = None
+
     return {
         'lead': serialize_crm_record(lead, 'lead', user=user, workspace=workspace),
         'already_converted': lead.status == Lead.STATUS_CONVERTED or lead.converted_at is not None,
         'account_matches': _find_account_matches(workspace, user, lead),
         'contact_matches': _find_contact_matches(workspace, user, lead),
-        'deal_stages': [serialize_pipeline_stage(stage) for stage in stages],
-        'defaults': {
-            'account_name': default_account_name,
-            'account_city': '',
-            'contact_name': lead.name,
-            'contact_title': '',
-            'deal_title': f'{default_account_name} Deal',
-            'deal_stage': default_stage.name,
-            'deal_amount': '0.00',
-            'target_close_date': None,
-            'win_probability': None,
-        },
+        'deal_stages': (
+            [serialize_pipeline_stage(stage) for stage in stages]
+            if deal_field_rights.get('stage', FIELD_RIGHT_EDITABLE) != FIELD_RIGHT_HIDDEN
+            else []
+        ),
+        'defaults': defaults,
         'capabilities': capability,
+        'field_rights': {
+            'account': account_field_rights,
+            'contact': contact_field_rights,
+            'deal': deal_field_rights,
+        },
     }
 
 
@@ -280,6 +409,16 @@ def _resolve_conversion_account(
         return account, False
 
     ensure_object_permission(user, workspace, 'account', 'create')
+    _ensure_conversion_writable_overrides(
+        user,
+        workspace,
+        'account',
+        payload,
+        {
+            'name': ('account_name', 'company'),
+            'city': ('account_city', 'city'),
+        },
+    )
     fallback_name = (lead.company or '').strip() or lead.name
     account_name = _parse_optional_override_name(
         payload,
@@ -336,19 +475,45 @@ def _resolve_conversion_contact(
                 status_code=400,
             )
         if contact.account_id is not None and contact.account_id != account.id:
+            existing_acc_label = _get_visible_record_label(
+                contact.account, 'account', user=user, workspace=workspace
+            )
+            target_acc_label = _get_visible_record_label(
+                account, 'account', user=user, workspace=workspace
+            )
             raise CrmDomainError(
-                f'Selected {contact_label} belongs to {contact.account.name}, not {account.name}.',
+                f'Selected {contact_label} belongs to {existing_acc_label}, not {target_acc_label}.',
                 status_code=400,
             )
         linked_existing_contact = False
         if contact.account_id is None:
             ensure_object_permission(user, workspace, 'contact', 'update')
+            if not is_workspace_owner(user, workspace):
+                acc_field_level = get_user_field_rights(user, workspace, 'contact').get(
+                    'account', FIELD_RIGHT_EDITABLE
+                )
+                if acc_field_level != FIELD_RIGHT_EDITABLE:
+                    level_label = 'hidden' if acc_field_level == FIELD_RIGHT_HIDDEN else 'read-only'
+                    raise CrmDomainError(
+                        f'Your role cannot modify Account because this field is {level_label}.',
+                        status_code=403,
+                    )
             contact.account = account
             contact.save(update_fields=['account', 'updated_at'])
             linked_existing_contact = True
         return contact, False, linked_existing_contact
 
     ensure_object_permission(user, workspace, 'contact', 'create')
+    _ensure_conversion_writable_overrides(
+        user,
+        workspace,
+        'contact',
+        payload,
+        {
+            'name': ('contact_name',),
+            'title': ('contact_title', 'title'),
+        },
+    )
     contact_name = _parse_optional_override_name(
         payload,
         'contact_name',
@@ -569,8 +734,11 @@ def convert_lead_record(
             raise CrmDomainError(f'{OBJECTS_BY_KEY["lead"].label} not found.', status_code=404)
 
         if lead.status == Lead.STATUS_CONVERTED or lead.converted_at is not None:
+            visible_lead_label = _get_visible_record_label(
+                lead, 'lead', user=user, workspace=workspace
+            )
             raise CrmDomainError(
-                f'Lead {lead.name} has already been converted and cannot be converted again.',
+                f'Lead {visible_lead_label} has already been converted and cannot be converted again.',
                 status_code=409,
             )
 
@@ -581,6 +749,20 @@ def convert_lead_record(
             lead,
             account,
             data,
+        )
+
+        _ensure_conversion_writable_overrides(
+            user,
+            workspace,
+            'deal',
+            data,
+            {
+                'title': ('deal_title', 'title'),
+                'stage': ('deal_stage', 'stage', 'deal_stage_id', 'stage_id', 'pipeline_stage_id'),
+                'amount': ('deal_amount', 'amount'),
+                'target_close_date': ('target_close_date',),
+                'win_probability': ('win_probability',),
+            },
         )
 
         deal_title = _parse_optional_override_name(
@@ -716,6 +898,9 @@ def convert_lead_record(
             'deal': True,
         },
         'message': (
-            f'Converted {lead.name} into {account.name}, {contact.name}, and {deal.title}.'
+            f'Converted {_get_visible_record_label(lead, "lead", user=user, workspace=workspace)} into '
+            f'{_get_visible_record_label(account, "account", user=user, workspace=workspace)}, '
+            f'{_get_visible_record_label(contact, "contact", user=user, workspace=workspace)}, and '
+            f'{_get_visible_record_label(deal, "deal", user=user, workspace=workspace)}.'
         ),
     }
