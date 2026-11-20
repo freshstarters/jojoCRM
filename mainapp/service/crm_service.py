@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
 import math
@@ -12,6 +11,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 
 from ..catalog import OBJECTS_BY_KEY
+from ..helpers.crm_errors import CrmDomainError
 from ..models import (
     Account,
     Activity,
@@ -21,16 +21,41 @@ from ..models import (
     Deal,
     Job,
     Lead,
+    PipelineStage,
+    Role,
     Ticket,
     User,
+    WorkspaceRecordBase,
     WorkspaceTable,
 )
 from .audit_service import record_audit_event
 from .catalog_service import ensure_workspace_catalog, get_workspace_table_record_counts
-from .role_service import user_has_object_right
+from .pipeline_service import (
+    ensure_workspace_pipeline,
+    get_ordered_pipeline_stages,
+    resolve_deal_stage,
+    serialize_pipeline_stage,
+)
+from .role_service import (
+    FIELD_RIGHT_EDITABLE,
+    FIELD_RIGHT_HIDDEN,
+    FIELD_RIGHT_READ_ONLY,
+    OBJECT_FIELD_SCHEMAS,
+    PRIMARY_LABEL_FIELD_BY_OBJECT,
+    build_record_visibility_q,
+    ensure_workspace_default_roles,
+    get_field_right,
+    get_user_field_rights,
+    is_workspace_owner,
+    user_can_manage_record_sharing,
+    user_can_manage_sales_settings,
+    user_can_see_record,
+    user_has_object_right,
+)
 
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 100
+DEFAULT_BOARD_PER_STAGE_LIMIT = 100
 
 OBJECT_KEY_ALIASES: dict[str, str] = {
     'account': 'account',
@@ -72,17 +97,6 @@ CRM_MODELS_BY_KEY = {
     'appointment': Appointment,
     'ticket': Ticket,
 }
-
-
-@dataclass(frozen=True)
-class CrmDomainError(Exception):
-    """Domain validation, permission, or conflict error for CRM CRUD operations."""
-
-    message: str
-    status_code: int = 400
-
-    def __str__(self) -> str:
-        return self.message
 
 
 def resolve_object_key(raw_key: str) -> str:
@@ -315,7 +329,126 @@ def _parse_fk_id(raw, *, field_name: str) -> int | None:
     return parsed
 
 
-def _resolve_account(workspace, payload: dict, *, existing=None) -> tuple[Account | None, bool]:
+VALID_VISIBILITY_VALUES: tuple[str, ...] = (
+    WorkspaceRecordBase.VISIBILITY_WORKSPACE,
+    WorkspaceRecordBase.VISIBILITY_ROLE,
+    WorkspaceRecordBase.VISIBILITY_OWNER,
+)
+
+REQUIRED_CREATE_FIELDS_BY_OBJECT: dict[str, tuple[str, ...]] = {
+    'account': ('name',),
+    'contact': ('name',),
+    'lead': ('name',),
+    'deal': ('title',),
+    'job': ('title',),
+    'appointment': ('contact', 'scheduled_at'),
+    'ticket': ('title',),
+    'activity': ('activity_type', 'summary'),
+}
+
+
+def _ensure_writable_fields(
+    user,
+    workspace,
+    object_key: str,
+    payload: dict,
+    *,
+    is_create: bool = False,
+) -> None:
+    """Reject writes to hidden or read-only fields for non-Owner roles."""
+    if is_workspace_owner(user, workspace):
+        return
+
+    field_rights = get_user_field_rights(user, workspace, object_key)
+    schemas = OBJECT_FIELD_SCHEMAS.get(object_key, ())
+    contact_label = _get_contact_screen_label(workspace)
+
+    for schema in schemas:
+        level = field_rights.get(schema.key, FIELD_RIGHT_EDITABLE)
+        if level == FIELD_RIGHT_EDITABLE:
+            continue
+        label = contact_label if schema.uses_contact_label else schema.label
+        level_label = 'hidden' if level == FIELD_RIGHT_HIDDEN else 'read-only'
+        if any(k in payload for k in schema.payload_keys):
+            raise CrmDomainError(
+                f'Your role cannot modify {label} because this field is {level_label}.',
+                status_code=403,
+            )
+        if is_create and schema.key in REQUIRED_CREATE_FIELDS_BY_OBJECT.get(object_key, ()):
+            raise CrmDomainError(
+                f'Your role cannot set required field {label} because it is {level_label}.',
+                status_code=403,
+            )
+
+
+def _resolve_sharing_fields(
+    workspace,
+    payload: dict,
+    *,
+    existing=None,
+    user=None,
+) -> tuple[str, Role | None, bool]:
+    """Parse and authorize record visibility and shared_role."""
+    explicit = _has_any_key(payload, 'visibility', 'shared_role_id', 'shared_role')
+    if not explicit:
+        if existing is not None:
+            return existing.visibility, existing.shared_role, False
+        return WorkspaceRecordBase.VISIBILITY_WORKSPACE, None, False
+
+    raw_vis = payload.get('visibility')
+    if raw_vis is None or raw_vis == '':
+        visibility = existing.visibility if existing is not None else WorkspaceRecordBase.VISIBILITY_WORKSPACE
+    else:
+        if not isinstance(raw_vis, str):
+            raise CrmDomainError('Visibility must be owner, role, or workspace.', status_code=400)
+        visibility = raw_vis.strip().lower()
+        if visibility not in VALID_VISIBILITY_VALUES:
+            raise CrmDomainError(
+                'Visibility must be one of: owner, role, workspace.',
+                status_code=400,
+            )
+
+    shared_role = None
+    if visibility == WorkspaceRecordBase.VISIBILITY_ROLE:
+        if _has_any_key(payload, 'shared_role_id', 'shared_role'):
+            raw_role = _first_present(payload, 'shared_role_id', 'shared_role')
+            role_id = _parse_fk_id(raw_role, field_name='Shared role')
+        elif existing is not None and existing.shared_role_id is not None:
+            role_id = existing.shared_role_id
+        else:
+            role_id = None
+
+        if role_id is None:
+            raise CrmDomainError(
+                'Select a workspace role when sharing a record with one role.',
+                status_code=400,
+            )
+        shared_role = Role.objects.filter(workspace=workspace, id=role_id).first()
+        if shared_role is None:
+            raise CrmDomainError(
+                'Selected sharing role was not found in this workspace.',
+                status_code=400,
+            )
+
+    if existing is not None and user is not None:
+        next_role_id = shared_role.id if shared_role is not None else None
+        if visibility != existing.visibility or next_role_id != existing.shared_role_id:
+            if not user_can_manage_record_sharing(user, workspace, existing):
+                raise CrmDomainError(
+                    'Only the record owner, workspace Owner, or a role with users-and-roles access can change sharing settings.',
+                    status_code=403,
+                )
+
+    return visibility, shared_role, True
+
+
+def _resolve_account(
+    workspace,
+    payload: dict,
+    *,
+    existing=None,
+    user=None,
+) -> tuple[Account | None, bool]:
     explicit = _has_any_key(payload, 'account_id', 'account')
     if not explicit:
         return (existing.account if existing is not None else None), False
@@ -323,13 +456,22 @@ def _resolve_account(workspace, payload: dict, *, existing=None) -> tuple[Accoun
     pk = _parse_fk_id(raw, field_name='Account')
     if pk is None:
         return None, True
-    account = Account.objects.filter(workspace=workspace, id=pk).first()
+    qs = Account.objects.filter(workspace=workspace, id=pk)
+    if user is not None:
+        qs = qs.filter(build_record_visibility_q(user, workspace))
+    account = qs.first()
     if account is None:
         raise CrmDomainError('Selected Account was not found in this workspace.', status_code=400)
     return account, True
 
 
-def _resolve_contact(workspace, payload: dict, *, existing=None) -> tuple[Contact | None, bool]:
+def _resolve_contact(
+    workspace,
+    payload: dict,
+    *,
+    existing=None,
+    user=None,
+) -> tuple[Contact | None, bool]:
     contact_label = _get_contact_screen_label(workspace)
     explicit = _has_any_key(payload, 'contact_id', 'contact')
     if not explicit:
@@ -338,11 +480,10 @@ def _resolve_contact(workspace, payload: dict, *, existing=None) -> tuple[Contac
     pk = _parse_fk_id(raw, field_name=contact_label)
     if pk is None:
         return None, True
-    contact = (
-        Contact.objects.select_related('account')
-        .filter(workspace=workspace, id=pk)
-        .first()
-    )
+    qs = Contact.objects.select_related('account').filter(workspace=workspace, id=pk)
+    if user is not None:
+        qs = qs.filter(build_record_visibility_q(user, workspace))
+    contact = qs.first()
     if contact is None:
         raise CrmDomainError(
             f'Selected {contact_label} was not found in this workspace.',
@@ -377,17 +518,19 @@ def _resolve_account_and_contact_pair(
     payload: dict,
     *,
     existing=None,
+    user=None,
 ) -> tuple[Account | None, Contact | None]:
     """Resolve linked Account and Contact with auto-fill and mismatch enforcement."""
     contact_label = _get_contact_screen_label(workspace)
-    account, account_explicit = _resolve_account(workspace, payload, existing=existing)
-    contact, contact_explicit = _resolve_contact(workspace, payload, existing=existing)
+    account, account_explicit = _resolve_account(workspace, payload, existing=existing, user=user)
+    contact, contact_explicit = _resolve_contact(workspace, payload, existing=existing, user=user)
 
     if contact is not None and contact.account_id is not None:
         if not account_explicit:
             # Auto-fill Account from Contact when omitted or when Contact changed without specifying Account.
             if existing is None or contact_explicit or account is None:
-                account = contact.account
+                if user is None or user_can_see_record(user, workspace, contact.account):
+                    account = contact.account
         elif account is None:
             raise CrmDomainError(
                 f'Cannot clear Account while the linked {contact_label} belongs to {contact.account.name}.',
@@ -443,6 +586,8 @@ def _format_audit_field_value(value):
         return value.name
     if isinstance(value, User):
         return value.email
+    if isinstance(value, Role):
+        return value.name
     if isinstance(value, datetime):
         return value.isoformat()
     if hasattr(value, 'isoformat'):
@@ -451,7 +596,7 @@ def _format_audit_field_value(value):
 
 
 def _resolve_activity_target(workspace, user, target_type_raw, target_id_raw):
-    """Validate an Activity target record inside the same workspace."""
+    """Validate an Activity target record inside the same workspace and caller visibility."""
     if not isinstance(target_type_raw, str) or not target_type_raw.strip():
         raise CrmDomainError('target_object_type is required for an Activity.', status_code=400)
     normalized_type = OBJECT_KEY_ALIASES.get(target_type_raw.strip().lower())
@@ -473,7 +618,11 @@ def _resolve_activity_target(workspace, user, target_type_raw, target_id_raw):
         raise CrmDomainError('target_object_id is required for an Activity.', status_code=400)
 
     target_model = CRM_MODELS_BY_KEY[normalized_type]
-    target_record = target_model.objects.filter(workspace=workspace, id=target_id).first()
+    target_record = (
+        target_model.objects.filter(workspace=workspace, id=target_id)
+        .filter(build_record_visibility_q(user, workspace))
+        .first()
+    )
     if target_record is None:
         raise CrmDomainError('Target record not found in this workspace.', status_code=404)
 
@@ -486,15 +635,83 @@ def _serialize_user_ref(user_obj: User | None) -> dict | None:
     return {'id': user_obj.id, 'email': user_obj.email}
 
 
-def _serialize_account_ref(account: Account | None) -> dict | None:
+def _serialize_role_ref(role_obj: Role | None) -> dict | None:
+    if role_obj is None:
+        return None
+    return {
+        'id': role_obj.id,
+        'name': role_obj.name,
+        'is_owner': bool(role_obj.is_owner),
+        'is_default_staff': bool(role_obj.is_default_staff),
+    }
+
+
+def _get_visible_record_label(record, object_key: str, *, user=None, workspace=None) -> str:
+    """Return display label or record_code fallback when the primary label field is hidden."""
+    primary_field = PRIMARY_LABEL_FIELD_BY_OBJECT.get(object_key)
+    if (
+        primary_field
+        and user is not None
+        and workspace is not None
+        and get_field_right(user, workspace, object_key, primary_field) == FIELD_RIGHT_HIDDEN
+    ):
+        return f'{RECORD_CODE_PREFIXES[object_key]}-{record.id}'
+    return get_record_label(record, object_key)
+
+
+def _strip_hidden_fields(
+    data: dict,
+    object_key: str,
+    *,
+    user=None,
+    workspace=None,
+) -> dict:
+    """Remove any field keys marked hidden for the caller's role on object_key."""
+    if user is None or workspace is None or is_workspace_owner(user, workspace):
+        return data
+    field_rights = get_user_field_rights(user, workspace, object_key)
+    for schema in OBJECT_FIELD_SCHEMAS.get(object_key, ()):
+        if field_rights.get(schema.key) == FIELD_RIGHT_HIDDEN:
+            for key in schema.serialized_keys:
+                data.pop(key, None)
+    return data
+
+
+def _serialize_account_ref(account: Account | None, *, user=None, workspace=None) -> dict | None:
     if account is None:
         return None
+    if user is not None and workspace is not None:
+        if not user_can_see_record(user, workspace, account):
+            return None
+        ref = {'id': account.id}
+        if get_field_right(user, workspace, 'account', 'name') != FIELD_RIGHT_HIDDEN:
+            ref['name'] = account.name
+        else:
+            ref['name'] = f'{RECORD_CODE_PREFIXES["account"]}-{account.id}'
+        if get_field_right(user, workspace, 'account', 'city') != FIELD_RIGHT_HIDDEN:
+            ref['city'] = account.city
+        return ref
     return {'id': account.id, 'name': account.name, 'city': account.city}
 
 
-def _serialize_contact_ref(contact: Contact | None) -> dict | None:
+def _serialize_contact_ref(contact: Contact | None, *, user=None, workspace=None) -> dict | None:
     if contact is None:
         return None
+    if user is not None and workspace is not None:
+        if not user_can_see_record(user, workspace, contact):
+            return None
+        ref = {'id': contact.id}
+        if get_field_right(user, workspace, 'contact', 'name') != FIELD_RIGHT_HIDDEN:
+            ref['name'] = contact.name
+        else:
+            ref['name'] = f'{RECORD_CODE_PREFIXES["contact"]}-{contact.id}'
+        if get_field_right(user, workspace, 'contact', 'email') != FIELD_RIGHT_HIDDEN:
+            ref['email'] = contact.email
+        if get_field_right(user, workspace, 'contact', 'phone') != FIELD_RIGHT_HIDDEN:
+            ref['phone'] = contact.phone
+        if get_field_right(user, workspace, 'contact', 'account') != FIELD_RIGHT_HIDDEN:
+            ref['account_id'] = contact.account_id
+        return ref
     return {
         'id': contact.id,
         'name': contact.name,
@@ -504,9 +721,30 @@ def _serialize_contact_ref(contact: Contact | None) -> dict | None:
     }
 
 
-def _serialize_lead_ref(lead: Lead | None) -> dict | None:
+def _serialize_lead_ref(lead: Lead | None, *, user=None, workspace=None) -> dict | None:
     if lead is None:
         return None
+    if user is not None and workspace is not None:
+        if not user_can_see_record(user, workspace, lead):
+            return None
+        ref = {
+            'id': lead.id,
+            'record_code': f'{RECORD_CODE_PREFIXES["lead"]}-{lead.id}',
+            'name': (
+                lead.name
+                if get_field_right(user, workspace, 'lead', 'name') != FIELD_RIGHT_HIDDEN
+                else f'{RECORD_CODE_PREFIXES["lead"]}-{lead.id}'
+            ),
+        }
+        if get_field_right(user, workspace, 'lead', 'company') != FIELD_RIGHT_HIDDEN:
+            ref['company'] = lead.company
+        if get_field_right(user, workspace, 'lead', 'email') != FIELD_RIGHT_HIDDEN:
+            ref['email'] = lead.email
+        if get_field_right(user, workspace, 'lead', 'phone') != FIELD_RIGHT_HIDDEN:
+            ref['phone'] = lead.phone
+        if get_field_right(user, workspace, 'lead', 'status') != FIELD_RIGHT_HIDDEN:
+            ref['status'] = lead.status
+        return ref
     return {
         'id': lead.id,
         'record_code': f'{RECORD_CODE_PREFIXES["lead"]}-{lead.id}',
@@ -518,14 +756,44 @@ def _serialize_lead_ref(lead: Lead | None) -> dict | None:
     }
 
 
-def _serialize_deal_ref(deal: Deal | None) -> dict | None:
+_STARTER_STAGE_TONES = {
+    name.lower(): tone for name, tone in PipelineStage.STARTER_STAGE_SPECS
+}
+
+
+def _resolve_deal_stage_tone(deal: Deal) -> str:
+    if getattr(deal, 'pipeline_stage_id', None) and getattr(deal, 'pipeline_stage', None):
+        return deal.pipeline_stage.tone
+    return _STARTER_STAGE_TONES.get((deal.stage or '').strip().lower(), PipelineStage.TONE_NEUTRAL)
+
+
+def _serialize_deal_ref(deal: Deal | None, *, user=None, workspace=None) -> dict | None:
     if deal is None:
         return None
+    if user is not None and workspace is not None:
+        if not user_can_see_record(user, workspace, deal):
+            return None
+        ref = {
+            'id': deal.id,
+            'record_code': f'{RECORD_CODE_PREFIXES["deal"]}-{deal.id}',
+            'title': (
+                deal.title
+                if get_field_right(user, workspace, 'deal', 'title') != FIELD_RIGHT_HIDDEN
+                else f'{RECORD_CODE_PREFIXES["deal"]}-{deal.id}'
+            ),
+        }
+        if get_field_right(user, workspace, 'deal', 'stage') != FIELD_RIGHT_HIDDEN:
+            ref['stage'] = deal.stage
+            ref['stage_tone'] = _resolve_deal_stage_tone(deal)
+        if get_field_right(user, workspace, 'deal', 'amount') != FIELD_RIGHT_HIDDEN:
+            ref['amount'] = f'{deal.amount:.2f}'
+        return ref
     return {
         'id': deal.id,
         'record_code': f'{RECORD_CODE_PREFIXES["deal"]}-{deal.id}',
         'title': deal.title,
         'stage': deal.stage,
+        'stage_tone': _resolve_deal_stage_tone(deal),
         'amount': f'{deal.amount:.2f}',
     }
 
@@ -587,14 +855,17 @@ def get_lead_conversion_capability(user, workspace) -> dict:
     }
 
 
-def _resolve_target_record_label(workspace, target_type: str, target_id: int) -> str:
+def _resolve_target_record_label(workspace, target_type: str, target_id: int, *, user=None) -> str:
     model_cls = CRM_MODELS_BY_KEY.get(target_type)
     if model_cls is None:
         return f'{target_type} #{target_id}'
-    row = model_cls.objects.filter(workspace=workspace, id=target_id).first()
+    qs = model_cls.objects.filter(workspace=workspace, id=target_id)
+    if user is not None:
+        qs = qs.filter(build_record_visibility_q(user, workspace))
+    row = qs.first()
     if row is None:
-        return f'{target_type} #{target_id}'
-    return get_record_label(row, target_type)
+        return f'{RECORD_CODE_PREFIXES.get(target_type, target_type)}-{target_id}'
+    return _get_visible_record_label(row, target_type, user=user, workspace=workspace)
 
 
 def _is_enabled_and_readable(user, workspace, object_key: str) -> bool:
@@ -615,14 +886,22 @@ def serialize_crm_record(
     user=None,
     workspace=None,
 ) -> dict:
-    """Serialize any S2.1 CRM record for list or detail views."""
+    """Serialize any S2.1 CRM record for list or detail views, enforcing field rights and sharing."""
+    ws = workspace or getattr(record, 'workspace', None)
     prefix = RECORD_CODE_PREFIXES[object_key]
     data = {
         'id': record.id,
         'object_key': object_key,
         'record_code': f'{prefix}-{record.id}',
-        'display_label': get_record_label(record, object_key),
+        'display_label': _get_visible_record_label(record, object_key, user=user, workspace=ws),
         'visibility': record.visibility,
+        'shared_role_id': record.shared_role_id,
+        'shared_role': _serialize_role_ref(record.shared_role),
+        'can_manage_sharing': (
+            user_can_manage_record_sharing(user, ws, record)
+            if user is not None and ws is not None
+            else False
+        ),
         'owner': _serialize_user_ref(record.owner),
         'created_by': _serialize_user_ref(record.created_by),
         'created_at': record.created_at.isoformat(),
@@ -630,7 +909,7 @@ def serialize_crm_record(
     }
 
     if object_key == 'account':
-        source_lead_ref = _serialize_lead_ref(record.source_lead)
+        source_lead_ref = _serialize_lead_ref(record.source_lead, user=user, workspace=ws)
         data.update(
             {
                 'name': record.name,
@@ -639,31 +918,35 @@ def serialize_crm_record(
                 'email': record.email,
                 'notes': record.notes,
                 'contacts_count': getattr(record, 'contacts_count', record.contacts.count()),
-                'source_lead_id': record.source_lead_id,
-                'lead_id': record.source_lead_id,
+                'source_lead_id': source_lead_ref['id'] if source_lead_ref else None,
+                'lead_id': source_lead_ref['id'] if source_lead_ref else None,
                 'source_lead': source_lead_ref,
                 'lead': source_lead_ref,
             }
         )
     elif object_key == 'contact':
-        source_lead_ref = _serialize_lead_ref(record.source_lead)
+        source_lead_ref = _serialize_lead_ref(record.source_lead, user=user, workspace=ws)
+        account_ref = _serialize_account_ref(record.account, user=user, workspace=ws)
         data.update(
             {
                 'name': record.name,
                 'title': record.title,
-                'account_id': record.account_id,
-                'account': _serialize_account_ref(record.account),
+                'account_id': account_ref['id'] if account_ref else None,
+                'account': account_ref,
                 'email': record.email,
                 'phone': record.phone,
                 'sms_consent': bool(record.sms_consent),
                 'notes': record.notes,
-                'source_lead_id': record.source_lead_id,
-                'lead_id': record.source_lead_id,
+                'source_lead_id': source_lead_ref['id'] if source_lead_ref else None,
+                'lead_id': source_lead_ref['id'] if source_lead_ref else None,
                 'source_lead': source_lead_ref,
                 'lead': source_lead_ref,
             }
         )
     elif object_key == 'lead':
+        converted_account_ref = _serialize_account_ref(record.converted_account, user=user, workspace=ws)
+        converted_contact_ref = _serialize_contact_ref(record.converted_contact, user=user, workspace=ws)
+        converted_deal_ref = _serialize_deal_ref(record.converted_deal, user=user, workspace=ws)
         data.update(
             {
                 'name': record.name,
@@ -675,26 +958,31 @@ def serialize_crm_record(
                 'converted': record.status == Lead.STATUS_CONVERTED,
                 'converted_at': record.converted_at.isoformat() if record.converted_at else None,
                 'converted_by': _serialize_user_ref(record.converted_by),
-                'converted_account_id': record.converted_account_id,
-                'converted_contact_id': record.converted_contact_id,
-                'converted_deal_id': record.converted_deal_id,
-                'converted_account': _serialize_account_ref(record.converted_account),
-                'converted_contact': _serialize_contact_ref(record.converted_contact),
-                'converted_deal': _serialize_deal_ref(record.converted_deal),
+                'converted_account_id': converted_account_ref['id'] if converted_account_ref else None,
+                'converted_contact_id': converted_contact_ref['id'] if converted_contact_ref else None,
+                'converted_deal_id': converted_deal_ref['id'] if converted_deal_ref else None,
+                'converted_account': converted_account_ref,
+                'converted_contact': converted_contact_ref,
+                'converted_deal': converted_deal_ref,
                 'notes': record.notes,
             }
         )
     elif object_key == 'deal':
-        source_lead_ref = _serialize_lead_ref(record.source_lead)
+        source_lead_ref = _serialize_lead_ref(record.source_lead, user=user, workspace=ws)
+        account_ref = _serialize_account_ref(record.account, user=user, workspace=ws)
+        contact_ref = _serialize_contact_ref(record.contact, user=user, workspace=ws)
         data.update(
             {
                 'title': record.title,
-                'account_id': record.account_id,
-                'account': _serialize_account_ref(record.account),
-                'contact_id': record.contact_id,
-                'contact': _serialize_contact_ref(record.contact),
+                'account_id': account_ref['id'] if account_ref else None,
+                'account': account_ref,
+                'contact_id': contact_ref['id'] if contact_ref else None,
+                'contact': contact_ref,
                 'amount': f'{record.amount:.2f}',
                 'stage': record.stage,
+                'stage_tone': _resolve_deal_stage_tone(record),
+                'pipeline_id': record.pipeline_id,
+                'pipeline_stage_id': record.pipeline_stage_id,
                 'target_close_date': (
                     record.target_close_date.isoformat() if record.target_close_date else None
                 ),
@@ -705,13 +993,15 @@ def serialize_crm_record(
                     else None
                 ),
                 'notes': record.notes,
-                'source_lead_id': record.source_lead_id,
-                'lead_id': record.source_lead_id,
+                'source_lead_id': source_lead_ref['id'] if source_lead_ref else None,
+                'lead_id': source_lead_ref['id'] if source_lead_ref else None,
                 'source_lead': source_lead_ref,
                 'lead': source_lead_ref,
             }
         )
     elif object_key == 'job':
+        account_ref = _serialize_account_ref(record.account, user=user, workspace=ws)
+        contact_ref = _serialize_contact_ref(record.contact, user=user, workspace=ws)
         data.update(
             {
                 'title': record.title,
@@ -719,15 +1009,16 @@ def serialize_crm_record(
                 'assignee_id': record.assignee_id,
                 'assignee': _serialize_user_ref(record.assignee),
                 'due_date': record.due_date.isoformat() if record.due_date else None,
-                'account_id': record.account_id,
-                'account': _serialize_account_ref(record.account),
-                'contact_id': record.contact_id,
-                'contact': _serialize_contact_ref(record.contact),
+                'account_id': account_ref['id'] if account_ref else None,
+                'account': account_ref,
+                'contact_id': contact_ref['id'] if contact_ref else None,
+                'contact': contact_ref,
                 'notes': record.notes,
             }
         )
     elif object_key == 'appointment':
         iso_time = record.scheduled_at.isoformat()
+        contact_ref = _serialize_contact_ref(record.contact, user=user, workspace=ws)
         data.update(
             {
                 'title': record.title,
@@ -736,28 +1027,29 @@ def serialize_crm_record(
                 'status': record.status,
                 'assignee_id': record.assignee_id,
                 'assignee': _serialize_user_ref(record.assignee),
-                'contact_id': record.contact_id,
-                'contact': _serialize_contact_ref(record.contact),
+                'contact_id': contact_ref['id'] if contact_ref else None,
+                'contact': contact_ref,
                 'notes': record.notes,
             }
         )
     elif object_key == 'ticket':
+        account_ref = _serialize_account_ref(record.account, user=user, workspace=ws)
+        contact_ref = _serialize_contact_ref(record.contact, user=user, workspace=ws)
         data.update(
             {
                 'title': record.title,
                 'status': record.status,
                 'priority': record.priority,
-                'account_id': record.account_id,
-                'account': _serialize_account_ref(record.account),
-                'contact_id': record.contact_id,
-                'contact': _serialize_contact_ref(record.contact),
+                'account_id': account_ref['id'] if account_ref else None,
+                'account': account_ref,
+                'contact_id': contact_ref['id'] if contact_ref else None,
+                'contact': contact_ref,
                 'assignee_id': record.assignee_id,
                 'assignee': _serialize_user_ref(record.assignee),
                 'description': record.description,
             }
         )
     elif object_key == 'activity':
-        ws = workspace or record.workspace
         data.update(
             {
                 'activity_type': record.activity_type,
@@ -768,6 +1060,7 @@ def serialize_crm_record(
                     ws,
                     record.target_object_type,
                     record.target_object_id,
+                    user=user,
                 ),
                 'summary': record.summary,
                 'text': record.summary,
@@ -778,24 +1071,27 @@ def serialize_crm_record(
             }
         )
 
-    if include_detail and workspace is not None and user is not None:
+    _strip_hidden_fields(data, object_key, user=user, workspace=ws)
+
+    if include_detail and ws is not None and user is not None:
         if object_key != 'activity':
-            can_read_activities = _is_enabled_and_readable(user, workspace, 'activity')
+            can_read_activities = _is_enabled_and_readable(user, ws, 'activity')
             data['activities_readable'] = can_read_activities
             if can_read_activities:
                 activities_qs = (
                     Activity.objects.filter(
-                        workspace=workspace,
+                        workspace=ws,
                         target_object_type=object_key,
                         target_object_id=record.id,
                     )
-                    .select_related('owner', 'created_by', 'assignee')
+                    .filter(build_record_visibility_q(user, ws))
+                    .select_related('owner', 'created_by', 'assignee', 'shared_role')
                     .order_by('-created_at', '-id')
                 )
                 activities_total_count = activities_qs.count()
                 activities = list(activities_qs[:100])
                 data['activities'] = [
-                    serialize_crm_record(act, 'activity', workspace=workspace)
+                    serialize_crm_record(act, 'activity', user=user, workspace=ws)
                     for act in activities
                 ]
                 data['activities_total_count'] = activities_total_count
@@ -805,7 +1101,7 @@ def serialize_crm_record(
                 data['activities_total_count'] = 0
                 data['has_more_activities'] = False
 
-        data['linked_records'] = _serialize_linked_records(record, object_key, user=user, workspace=workspace)
+        data['linked_records'] = _serialize_linked_records(record, object_key, user=user, workspace=ws)
 
     return data
 
@@ -815,137 +1111,263 @@ def _attach_source_leads(linked: dict, record, *, user, workspace) -> None:
         return
     leads_by_id: dict[int, Lead] = {}
     if getattr(record, 'source_lead_id', None) and getattr(record, 'source_lead', None):
-        leads_by_id[record.source_lead_id] = record.source_lead
+        if user_can_see_record(user, workspace, record.source_lead):
+            leads_by_id[record.source_lead_id] = record.source_lead
     if hasattr(record, 'source_leads'):
-        for row in record.source_leads.filter(workspace=workspace).order_by('-converted_at', '-id')[:25]:
+        for row in (
+            record.source_leads.filter(workspace=workspace)
+            .filter(build_record_visibility_q(user, workspace))
+            .order_by('-converted_at', '-id')[:25]
+        ):
             leads_by_id.setdefault(row.id, row)
     if leads_by_id:
-        serialized = [_serialize_lead_ref(row) for row in leads_by_id.values()]
-        linked['lead'] = serialized[0]
-        linked['source_leads'] = serialized
+        serialized = [
+            ref
+            for row in leads_by_id.values()
+            if (ref := _serialize_lead_ref(row, user=user, workspace=workspace)) is not None
+        ]
+        if serialized:
+            linked['lead'] = serialized[0]
+            linked['source_leads'] = serialized
 
 
 def _serialize_linked_records(record, object_key: str, *, user, workspace) -> dict:
     linked: dict = {}
+    vis_q = build_record_visibility_q(user, workspace)
+
+    def _linked_contact_item(c: Contact) -> dict:
+        item = {'id': c.id, 'name': _get_visible_record_label(c, 'contact', user=user, workspace=workspace)}
+        if get_field_right(user, workspace, 'contact', 'title') != FIELD_RIGHT_HIDDEN:
+            item['title'] = c.title
+        if get_field_right(user, workspace, 'contact', 'email') != FIELD_RIGHT_HIDDEN:
+            item['email'] = c.email
+        return item
+
+    def _linked_deal_item(d: Deal) -> dict:
+        item = {'id': d.id, 'title': _get_visible_record_label(d, 'deal', user=user, workspace=workspace)}
+        if get_field_right(user, workspace, 'deal', 'stage') != FIELD_RIGHT_HIDDEN:
+            item['stage'] = d.stage
+        if get_field_right(user, workspace, 'deal', 'amount') != FIELD_RIGHT_HIDDEN:
+            item['amount'] = f'{d.amount:.2f}'
+        return item
+
+    def _linked_job_item(j: Job) -> dict:
+        item = {'id': j.id, 'title': _get_visible_record_label(j, 'job', user=user, workspace=workspace)}
+        if get_field_right(user, workspace, 'job', 'status') != FIELD_RIGHT_HIDDEN:
+            item['status'] = j.status
+        if get_field_right(user, workspace, 'job', 'due_date') != FIELD_RIGHT_HIDDEN:
+            item['due_date'] = j.due_date.isoformat() if j.due_date else None
+        return item
+
+    def _linked_ticket_item(t: Ticket) -> dict:
+        item = {'id': t.id, 'title': _get_visible_record_label(t, 'ticket', user=user, workspace=workspace)}
+        if get_field_right(user, workspace, 'ticket', 'status') != FIELD_RIGHT_HIDDEN:
+            item['status'] = t.status
+        if get_field_right(user, workspace, 'ticket', 'priority') != FIELD_RIGHT_HIDDEN:
+            item['priority'] = t.priority
+        return item
+
+    def _linked_appointment_item(a: Appointment) -> dict:
+        item = {'id': a.id, 'title': _get_visible_record_label(a, 'appointment', user=user, workspace=workspace)}
+        if get_field_right(user, workspace, 'appointment', 'status') != FIELD_RIGHT_HIDDEN:
+            item['status'] = a.status
+        if get_field_right(user, workspace, 'appointment', 'scheduled_at') != FIELD_RIGHT_HIDDEN:
+            item['scheduled_at'] = a.scheduled_at.isoformat()
+        return item
 
     if object_key == 'account':
         _attach_source_leads(linked, record, user=user, workspace=workspace)
         if _is_enabled_and_readable(user, workspace, 'contact'):
             linked['contacts'] = [
-                {
-                    'id': c.id,
-                    'name': c.name,
-                    'title': c.title,
-                    'email': c.email,
-                }
-                for c in record.contacts.filter(workspace=workspace).order_by('name', 'id')[:50]
+                _linked_contact_item(c)
+                for c in record.contacts.filter(workspace=workspace).filter(vis_q).order_by('name', 'id')[:50]
             ]
         if _is_enabled_and_readable(user, workspace, 'deal'):
             linked['deals'] = [
-                {
-                    'id': d.id,
-                    'title': d.title,
-                    'stage': d.stage,
-                    'amount': f'{d.amount:.2f}',
-                }
-                for d in record.deals.filter(workspace=workspace).order_by('-updated_at', '-id')[:50]
+                _linked_deal_item(d)
+                for d in record.deals.filter(workspace=workspace).filter(vis_q).order_by('-updated_at', '-id')[:50]
             ]
         if _is_enabled_and_readable(user, workspace, 'job'):
             linked['jobs'] = [
-                {
-                    'id': j.id,
-                    'title': j.title,
-                    'status': j.status,
-                    'due_date': j.due_date.isoformat() if j.due_date else None,
-                }
-                for j in record.jobs.filter(workspace=workspace).order_by('-updated_at', '-id')[:50]
+                _linked_job_item(j)
+                for j in record.jobs.filter(workspace=workspace).filter(vis_q).order_by('-updated_at', '-id')[:50]
             ]
         if _is_enabled_and_readable(user, workspace, 'ticket'):
             linked['tickets'] = [
-                {
-                    'id': t.id,
-                    'title': t.title,
-                    'status': t.status,
-                    'priority': t.priority,
-                }
-                for t in record.tickets.filter(workspace=workspace).order_by('-updated_at', '-id')[:50]
+                _linked_ticket_item(t)
+                for t in record.tickets.filter(workspace=workspace).filter(vis_q).order_by('-updated_at', '-id')[:50]
             ]
 
     elif object_key == 'contact':
         _attach_source_leads(linked, record, user=user, workspace=workspace)
         if record.account_id and _is_enabled_and_readable(user, workspace, 'account'):
-            linked['account'] = _serialize_account_ref(record.account)
+            acc_ref = _serialize_account_ref(record.account, user=user, workspace=workspace)
+            if acc_ref is not None:
+                linked['account'] = acc_ref
         if _is_enabled_and_readable(user, workspace, 'deal'):
             linked['deals'] = [
-                {
-                    'id': d.id,
-                    'title': d.title,
-                    'stage': d.stage,
-                    'amount': f'{d.amount:.2f}',
-                }
-                for d in record.deals.filter(workspace=workspace).order_by('-updated_at', '-id')[:50]
+                _linked_deal_item(d)
+                for d in record.deals.filter(workspace=workspace).filter(vis_q).order_by('-updated_at', '-id')[:50]
             ]
         if _is_enabled_and_readable(user, workspace, 'job'):
             linked['jobs'] = [
-                {
-                    'id': j.id,
-                    'title': j.title,
-                    'status': j.status,
-                    'due_date': j.due_date.isoformat() if j.due_date else None,
-                }
-                for j in record.jobs.filter(workspace=workspace).order_by('-updated_at', '-id')[:50]
+                _linked_job_item(j)
+                for j in record.jobs.filter(workspace=workspace).filter(vis_q).order_by('-updated_at', '-id')[:50]
             ]
         if _is_enabled_and_readable(user, workspace, 'appointment'):
             linked['appointments'] = [
-                {
-                    'id': a.id,
-                    'title': a.title,
-                    'status': a.status,
-                    'scheduled_at': a.scheduled_at.isoformat(),
-                }
-                for a in record.appointments.filter(workspace=workspace).order_by('scheduled_at', '-id')[:50]
+                _linked_appointment_item(a)
+                for a in record.appointments.filter(workspace=workspace).filter(vis_q).order_by('scheduled_at', '-id')[:50]
             ]
         if _is_enabled_and_readable(user, workspace, 'ticket'):
             linked['tickets'] = [
-                {
-                    'id': t.id,
-                    'title': t.title,
-                    'status': t.status,
-                    'priority': t.priority,
-                }
-                for t in record.tickets.filter(workspace=workspace).order_by('-updated_at', '-id')[:50]
+                _linked_ticket_item(t)
+                for t in record.tickets.filter(workspace=workspace).filter(vis_q).order_by('-updated_at', '-id')[:50]
             ]
 
     elif object_key == 'lead':
         if record.converted_account_id and _is_enabled_and_readable(user, workspace, 'account'):
-            linked['account'] = _serialize_account_ref(record.converted_account)
+            acc_ref = _serialize_account_ref(record.converted_account, user=user, workspace=workspace)
+            if acc_ref is not None:
+                linked['account'] = acc_ref
         if record.converted_contact_id and _is_enabled_and_readable(user, workspace, 'contact'):
-            linked['contact'] = _serialize_contact_ref(record.converted_contact)
+            con_ref = _serialize_contact_ref(record.converted_contact, user=user, workspace=workspace)
+            if con_ref is not None:
+                linked['contact'] = con_ref
         if record.converted_deal_id and _is_enabled_and_readable(user, workspace, 'deal'):
-            deal_ref = _serialize_deal_ref(record.converted_deal)
-            linked['deal'] = deal_ref
-            linked['deals'] = [deal_ref]
+            deal_ref = _serialize_deal_ref(record.converted_deal, user=user, workspace=workspace)
+            if deal_ref is not None:
+                linked['deal'] = deal_ref
+                linked['deals'] = [deal_ref]
 
     elif object_key in ('deal', 'job', 'ticket'):
         if object_key == 'deal':
             _attach_source_leads(linked, record, user=user, workspace=workspace)
         if record.account_id and _is_enabled_and_readable(user, workspace, 'account'):
-            linked['account'] = _serialize_account_ref(record.account)
+            acc_ref = _serialize_account_ref(record.account, user=user, workspace=workspace)
+            if acc_ref is not None:
+                linked['account'] = acc_ref
         if record.contact_id and _is_enabled_and_readable(user, workspace, 'contact'):
-            linked['contact'] = _serialize_contact_ref(record.contact)
+            con_ref = _serialize_contact_ref(record.contact, user=user, workspace=workspace)
+            if con_ref is not None:
+                linked['contact'] = con_ref
 
     elif object_key == 'appointment':
         if record.contact_id and _is_enabled_and_readable(user, workspace, 'contact'):
-            linked['contact'] = _serialize_contact_ref(record.contact)
+            con_ref = _serialize_contact_ref(record.contact, user=user, workspace=workspace)
+            if con_ref is not None:
+                linked['contact'] = con_ref
 
     return linked
 
 
-def _build_base_queryset(workspace, object_key: str):
+def _is_field_visible(user, workspace, object_key: str, field_name: str) -> bool:
+    if user is None or workspace is None:
+        return True
+    return get_field_right(user, workspace, object_key, field_name) != FIELD_RIGHT_HIDDEN
+
+
+def _apply_visibility_query_filters(qs, query_params):
+    vis_filter = (query_params.get('visibility') or '').strip().lower()
+    if vis_filter in VALID_VISIBILITY_VALUES:
+        qs = qs.filter(visibility=vis_filter)
+    raw_shared_role = query_params.get('shared_role_id')
+    if raw_shared_role:
+        role_id = _parse_fk_id(raw_shared_role, field_name='Shared role')
+        qs = qs.filter(visibility=WorkspaceRecordBase.VISIBILITY_ROLE, shared_role_id=role_id)
+    return qs
+
+
+def _apply_deal_filters(qs, query_params, *, include_stage: bool = True, user=None, workspace=None):
+    qs = _apply_visibility_query_filters(qs, query_params)
+    q = (query_params.get('q') or '').strip()
+    if q:
+        search_q = Q()
+        if _is_field_visible(user, workspace, 'deal', 'title'):
+            search_q |= Q(title__icontains=q)
+        if _is_field_visible(user, workspace, 'deal', 'account') and _is_field_visible(user, workspace, 'account', 'name'):
+            search_q |= Q(account__name__icontains=q)
+        if _is_field_visible(user, workspace, 'deal', 'contact') and _is_field_visible(user, workspace, 'contact', 'name'):
+            search_q |= Q(contact__name__icontains=q)
+        qs = qs.filter(search_q) if search_q else qs.none()
+    if include_stage and _is_field_visible(user, workspace, 'deal', 'stage'):
+        stage_filter = (query_params.get('stage') or '').strip()
+        if stage_filter:
+            qs = qs.filter(stage__iexact=stage_filter)
+    if query_params.get('account_id') and _is_field_visible(user, workspace, 'deal', 'account'):
+        qs = qs.filter(account_id=_parse_fk_id(query_params.get('account_id'), field_name='Account'))
+    if query_params.get('contact_id') and _is_field_visible(user, workspace, 'deal', 'contact'):
+        qs = qs.filter(contact_id=_parse_fk_id(query_params.get('contact_id'), field_name='Contact'))
+    return qs
+
+
+def _build_deal_stage_summary(workspace, qs, *, user=None) -> dict:
+    pipeline = ensure_workspace_pipeline(workspace, require_enabled=False)
+    stages = (
+        list(PipelineStage.objects.filter(pipeline=pipeline).order_by('position', 'id'))
+        if pipeline is not None
+        else []
+    )
+    amount_visible = _is_field_visible(user, workspace, 'deal', 'amount')
+    stage_visible = _is_field_visible(user, workspace, 'deal', 'stage')
+    total_amount = (
+        (qs.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'))
+        if amount_visible
+        else None
+    )
+
+    counts_by_id: dict[int, int] = {stage.id: 0 for stage in stages}
+    amounts_by_id: dict[int, Decimal] = {stage.id: Decimal('0.00') for stage in stages}
+    stages_by_lower = {stage.name.lower(): stage for stage in stages}
+
+    if stage_visible:
+        for row in qs.values('pipeline_stage_id', 'stage').annotate(cnt=Count('id'), val=Sum('amount')):
+            stage_id = row['pipeline_stage_id']
+            if stage_id not in counts_by_id:
+                matched = stages_by_lower.get((row['stage'] or '').strip().lower())
+                stage_id = matched.id if matched else None
+            if stage_id is not None:
+                counts_by_id[stage_id] += int(row['cnt'] or 0)
+                if amount_visible:
+                    amounts_by_id[stage_id] += row['val'] or Decimal('0.00')
+
+    stage_counts = {stage.name: counts_by_id[stage.id] for stage in stages} if stage_visible else {}
+    stage_amounts = (
+        {stage.name: f'{amounts_by_id[stage.id]:.2f}' for stage in stages}
+        if stage_visible and amount_visible
+        else {}
+    )
+    stage_tones = {stage.name: stage.tone for stage in stages}
+    return {
+        'pipeline': (
+            {'id': pipeline.id, 'name': pipeline.name}
+            if pipeline is not None
+            else None
+        ),
+        'total_amount': f'{total_amount:.2f}' if total_amount is not None else None,
+        'stages': [serialize_pipeline_stage(stage) for stage in stages],
+        'stage_counts': stage_counts,
+        'stage_amounts': stage_amounts,
+        'stage_tones': stage_tones,
+    }
+
+
+def _build_base_queryset(workspace, object_key: str, *, user=None):
     model_cls = CRM_MODELS_BY_KEY[object_key]
-    qs = model_cls.objects.filter(workspace=workspace).select_related('owner', 'created_by')
+    qs = model_cls.objects.filter(workspace=workspace).select_related(
+        'owner', 'created_by', 'shared_role'
+    )
+    if user is not None:
+        qs = qs.filter(build_record_visibility_q(user, workspace))
     if object_key == 'account':
-        qs = qs.select_related('source_lead').annotate(contacts_count=Count('contacts', distinct=True))
+        contact_count_filter = (
+            build_record_visibility_q(user, workspace, prefix='contacts__')
+            if user is not None
+            else Q()
+        )
+        qs = qs.select_related('source_lead').annotate(
+            contacts_count=Count('contacts', filter=contact_count_filter, distinct=True)
+        )
     elif object_key == 'contact':
         qs = qs.select_related('account', 'source_lead')
     elif object_key == 'lead':
@@ -956,7 +1378,7 @@ def _build_base_queryset(workspace, object_key: str):
             'converted_deal',
         )
     elif object_key == 'deal':
-        qs = qs.select_related('account', 'contact', 'source_lead')
+        qs = qs.select_related('account', 'contact', 'source_lead', 'pipeline', 'pipeline_stage')
     elif object_key == 'job':
         qs = qs.select_related('account', 'contact', 'assignee')
     elif object_key == 'appointment':
@@ -980,126 +1402,129 @@ def list_crm_records(
     """List paginated, filtered, and searched records for an enabled CRM object."""
     ensure_object_permission(user, workspace, object_key, 'read')
 
-    qs = _build_base_queryset(workspace, object_key)
+    qs = _build_base_queryset(workspace, object_key, user=user)
+    if object_key != 'deal':
+        qs = _apply_visibility_query_filters(qs, query_params)
     q = (query_params.get('q') or '').strip()
 
     if object_key == 'account':
         if q:
-            qs = qs.filter(
-                Q(name__icontains=q)
-                | Q(city__icontains=q)
-                | Q(email__icontains=q)
-                | Q(phone__icontains=q)
-            )
+            search_q = Q()
+            for f in ('name', 'city', 'email', 'phone'):
+                if _is_field_visible(user, workspace, 'account', f):
+                    search_q |= Q(**{f'{f}__icontains': q})
+            qs = qs.filter(search_q) if search_q else qs.none()
         city = (query_params.get('city') or '').strip()
-        if city:
+        if city and _is_field_visible(user, workspace, 'account', 'city'):
             qs = qs.filter(city__iexact=city)
 
     elif object_key == 'contact':
         if q:
-            qs = qs.filter(
-                Q(name__icontains=q)
-                | Q(title__icontains=q)
-                | Q(email__icontains=q)
-                | Q(phone__icontains=q)
-                | Q(account__name__icontains=q)
-            )
+            search_q = Q()
+            for f in ('name', 'title', 'email', 'phone'):
+                if _is_field_visible(user, workspace, 'contact', f):
+                    search_q |= Q(**{f'{f}__icontains': q})
+            if _is_field_visible(user, workspace, 'contact', 'account') and _is_field_visible(user, workspace, 'account', 'name'):
+                search_q |= Q(account__name__icontains=q)
+            qs = qs.filter(search_q) if search_q else qs.none()
         raw_acc = query_params.get('account_id')
-        if raw_acc:
+        if raw_acc and _is_field_visible(user, workspace, 'contact', 'account'):
             acc_id = _parse_fk_id(raw_acc, field_name='Account')
             qs = qs.filter(account_id=acc_id)
         raw_consent = (query_params.get('sms_consent') or '').strip().lower()
-        if raw_consent in ('on', 'true', '1'):
-            qs = qs.filter(sms_consent=True)
-        elif raw_consent in ('off', 'false', '0'):
-            qs = qs.filter(sms_consent=False)
+        if _is_field_visible(user, workspace, 'contact', 'sms_consent'):
+            if raw_consent in ('on', 'true', '1'):
+                qs = qs.filter(sms_consent=True)
+            elif raw_consent in ('off', 'false', '0'):
+                qs = qs.filter(sms_consent=False)
 
     elif object_key == 'lead':
         if q:
-            qs = qs.filter(
-                Q(name__icontains=q)
-                | Q(company__icontains=q)
-                | Q(email__icontains=q)
-                | Q(phone__icontains=q)
-            )
+            search_q = Q()
+            for f in ('name', 'company', 'email', 'phone'):
+                if _is_field_visible(user, workspace, 'lead', f):
+                    search_q |= Q(**{f'{f}__icontains': q})
+            qs = qs.filter(search_q) if search_q else qs.none()
         status_filter = (query_params.get('status') or '').strip().lower()
-        if status_filter in (Lead.STATUS_OPEN, Lead.STATUS_CONVERTED):
+        if status_filter in (Lead.STATUS_OPEN, Lead.STATUS_CONVERTED) and _is_field_visible(user, workspace, 'lead', 'status'):
             qs = qs.filter(status=status_filter)
 
     elif object_key == 'deal':
-        if q:
-            qs = qs.filter(
-                Q(title__icontains=q)
-                | Q(account__name__icontains=q)
-                | Q(contact__name__icontains=q)
-            )
-        stage_filter = (query_params.get('stage') or '').strip()
-        if stage_filter:
-            qs = qs.filter(stage__iexact=stage_filter)
-        if query_params.get('account_id'):
-            qs = qs.filter(account_id=_parse_fk_id(query_params.get('account_id'), field_name='Account'))
-        if query_params.get('contact_id'):
-            qs = qs.filter(contact_id=_parse_fk_id(query_params.get('contact_id'), field_name='Contact'))
+        qs = _apply_deal_filters(qs, query_params, include_stage=True, user=user, workspace=workspace)
 
     elif object_key == 'job':
         if q:
-            qs = qs.filter(
-                Q(title__icontains=q)
-                | Q(account__name__icontains=q)
-                | Q(contact__name__icontains=q)
-                | Q(assignee__email__icontains=q)
-            )
+            search_q = Q()
+            if _is_field_visible(user, workspace, 'job', 'title'):
+                search_q |= Q(title__icontains=q)
+            if _is_field_visible(user, workspace, 'job', 'account') and _is_field_visible(user, workspace, 'account', 'name'):
+                search_q |= Q(account__name__icontains=q)
+            if _is_field_visible(user, workspace, 'job', 'contact') and _is_field_visible(user, workspace, 'contact', 'name'):
+                search_q |= Q(contact__name__icontains=q)
+            if _is_field_visible(user, workspace, 'job', 'assignee'):
+                search_q |= Q(assignee__email__icontains=q)
+            qs = qs.filter(search_q) if search_q else qs.none()
         status_filter = (query_params.get('status') or '').strip()
-        if status_filter:
+        if status_filter and _is_field_visible(user, workspace, 'job', 'status'):
             qs = qs.filter(status__iexact=status_filter)
-        if query_params.get('assignee_id'):
+        if query_params.get('assignee_id') and _is_field_visible(user, workspace, 'job', 'assignee'):
             qs = qs.filter(assignee_id=_parse_fk_id(query_params.get('assignee_id'), field_name='Assignee'))
-        if query_params.get('account_id'):
+        if query_params.get('account_id') and _is_field_visible(user, workspace, 'job', 'account'):
             qs = qs.filter(account_id=_parse_fk_id(query_params.get('account_id'), field_name='Account'))
-        if query_params.get('contact_id'):
+        if query_params.get('contact_id') and _is_field_visible(user, workspace, 'job', 'contact'):
             qs = qs.filter(contact_id=_parse_fk_id(query_params.get('contact_id'), field_name='Contact'))
 
     elif object_key == 'appointment':
         if q:
-            qs = qs.filter(
-                Q(title__icontains=q)
-                | Q(contact__name__icontains=q)
-                | Q(assignee__email__icontains=q)
-            )
+            search_q = Q()
+            if _is_field_visible(user, workspace, 'appointment', 'title'):
+                search_q |= Q(title__icontains=q)
+            if _is_field_visible(user, workspace, 'appointment', 'contact') and _is_field_visible(user, workspace, 'contact', 'name'):
+                search_q |= Q(contact__name__icontains=q)
+            if _is_field_visible(user, workspace, 'appointment', 'assignee'):
+                search_q |= Q(assignee__email__icontains=q)
+            qs = qs.filter(search_q) if search_q else qs.none()
         status_filter = (query_params.get('status') or '').strip()
-        if status_filter:
+        if status_filter and _is_field_visible(user, workspace, 'appointment', 'status'):
             qs = qs.filter(status__iexact=status_filter)
-        if query_params.get('assignee_id'):
+        if query_params.get('assignee_id') and _is_field_visible(user, workspace, 'appointment', 'assignee'):
             qs = qs.filter(assignee_id=_parse_fk_id(query_params.get('assignee_id'), field_name='Assignee'))
-        if query_params.get('contact_id'):
+        if query_params.get('contact_id') and _is_field_visible(user, workspace, 'appointment', 'contact'):
             qs = qs.filter(contact_id=_parse_fk_id(query_params.get('contact_id'), field_name='Contact'))
 
     elif object_key == 'ticket':
         if q:
-            qs = qs.filter(
-                Q(title__icontains=q)
-                | Q(account__name__icontains=q)
-                | Q(contact__name__icontains=q)
-                | Q(description__icontains=q)
-            )
+            search_q = Q()
+            if _is_field_visible(user, workspace, 'ticket', 'title'):
+                search_q |= Q(title__icontains=q)
+            if _is_field_visible(user, workspace, 'ticket', 'account') and _is_field_visible(user, workspace, 'account', 'name'):
+                search_q |= Q(account__name__icontains=q)
+            if _is_field_visible(user, workspace, 'ticket', 'contact') and _is_field_visible(user, workspace, 'contact', 'name'):
+                search_q |= Q(contact__name__icontains=q)
+            if _is_field_visible(user, workspace, 'ticket', 'description'):
+                search_q |= Q(description__icontains=q)
+            qs = qs.filter(search_q) if search_q else qs.none()
         status_filter = (query_params.get('status') or '').strip()
-        if status_filter:
+        if status_filter and _is_field_visible(user, workspace, 'ticket', 'status'):
             qs = qs.filter(status__iexact=status_filter)
         priority_filter = (query_params.get('priority') or '').strip()
-        if priority_filter:
+        if priority_filter and _is_field_visible(user, workspace, 'ticket', 'priority'):
             qs = qs.filter(priority__iexact=priority_filter)
-        if query_params.get('assignee_id'):
+        if query_params.get('assignee_id') and _is_field_visible(user, workspace, 'ticket', 'assignee'):
             qs = qs.filter(assignee_id=_parse_fk_id(query_params.get('assignee_id'), field_name='Assignee'))
-        if query_params.get('account_id'):
+        if query_params.get('account_id') and _is_field_visible(user, workspace, 'ticket', 'account'):
             qs = qs.filter(account_id=_parse_fk_id(query_params.get('account_id'), field_name='Account'))
-        if query_params.get('contact_id'):
+        if query_params.get('contact_id') and _is_field_visible(user, workspace, 'ticket', 'contact'):
             qs = qs.filter(contact_id=_parse_fk_id(query_params.get('contact_id'), field_name='Contact'))
 
     elif object_key == 'activity':
         if q:
-            qs = qs.filter(Q(summary__icontains=q))
+            if _is_field_visible(user, workspace, 'activity', 'summary'):
+                qs = qs.filter(Q(summary__icontains=q))
+            else:
+                qs = qs.none()
         act_type = (query_params.get('activity_type') or '').strip().lower()
-        if act_type:
+        if act_type and _is_field_visible(user, workspace, 'activity', 'activity_type'):
             qs = qs.filter(activity_type=act_type)
         target_type = (query_params.get('target_object_type') or '').strip().lower()
         if target_type:
@@ -1112,10 +1537,10 @@ def list_crm_records(
                     field_name='target_object_id',
                 )
             )
-        if query_params.get('assignee_id'):
+        if query_params.get('assignee_id') and _is_field_visible(user, workspace, 'activity', 'assignee'):
             qs = qs.filter(assignee_id=_parse_fk_id(query_params.get('assignee_id'), field_name='Assignee'))
 
-    summary = _compute_list_summary(workspace, object_key, qs)
+    summary = _compute_list_summary(workspace, object_key, qs, user=user)
     total_count = qs.count()
     total_pages = max(1, math.ceil(total_count / page_size)) if total_count else 1
     offset = (page - 1) * page_size
@@ -1126,6 +1551,7 @@ def list_crm_records(
         'can_read': True,
         'can_update': user_has_object_right(user, workspace, object_key, 'update'),
         'can_delete': user_has_object_right(user, workspace, object_key, 'delete'),
+        'field_rights': get_user_field_rights(user, workspace, object_key),
     }
     if object_key in ('lead', 'deal'):
         cap = get_lead_conversion_capability(user, workspace)
@@ -1134,7 +1560,7 @@ def list_crm_records(
 
     return {
         'results': [
-            serialize_crm_record(row, object_key, workspace=workspace)
+            serialize_crm_record(row, object_key, user=user, workspace=workspace)
             for row in rows
         ],
         'total_count': total_count,
@@ -1148,10 +1574,15 @@ def list_crm_records(
     }
 
 
-def _compute_list_summary(workspace, object_key: str, qs) -> dict:
+def _compute_list_summary(workspace, object_key: str, qs, *, user=None) -> dict:
     if object_key == 'account':
+        if not _is_field_visible(user, workspace, 'account', 'city'):
+            return {'cities': [], 'city_counts': []}
+        city_base = Account.objects.filter(workspace=workspace)
+        if user is not None:
+            city_base = city_base.filter(build_record_visibility_q(user, workspace))
         cities = list(
-            Account.objects.filter(workspace=workspace)
+            city_base
             .exclude(city='')
             .values_list('city', flat=True)
             .distinct()
@@ -1163,52 +1594,52 @@ def _compute_list_summary(workspace, object_key: str, qs) -> dict:
         ]
         return {'cities': cities, 'city_counts': city_counts}
     if object_key == 'contact':
+        if not _is_field_visible(user, workspace, 'contact', 'sms_consent'):
+            return {}
         return {
             'sms_consented_count': qs.filter(sms_consent=True).count(),
         }
     if object_key == 'lead':
+        if not _is_field_visible(user, workspace, 'lead', 'status'):
+            return {}
         return {
             'open_count': qs.filter(status=Lead.STATUS_OPEN).count(),
             'converted_count': qs.filter(status=Lead.STATUS_CONVERTED).count(),
         }
     if object_key == 'deal':
-        total_amount = qs.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-        stage_counts = {stage: 0 for stage in Deal.DEFAULT_STAGES}
-        stage_amounts = {stage: '0.00' for stage in Deal.DEFAULT_STAGES}
-        for row in qs.values('stage').annotate(cnt=Count('id'), val=Sum('amount')):
-            stage_counts[row['stage']] = row['cnt']
-            stage_amounts[row['stage']] = f"{(row['val'] or Decimal('0.00')):.2f}"
-        return {
-            'total_amount': f'{total_amount:.2f}',
-            'stage_counts': stage_counts,
-            'stage_amounts': stage_amounts,
-        }
+        return _build_deal_stage_summary(workspace, qs, user=user)
     if object_key == 'job':
+        if not _is_field_visible(user, workspace, 'job', 'status'):
+            return {}
         return {
             'open_count': qs.filter(status__in=('Pending', 'In Progress')).count(),
             'completed_count': qs.filter(status='Completed').count(),
         }
     if object_key == 'appointment':
+        if not _is_field_visible(user, workspace, 'appointment', 'status'):
+            return {}
         return {
             'upcoming_count': qs.filter(status__in=('Scheduled', 'Confirmed')).count(),
             'completed_count': qs.filter(status='Completed').count(),
         }
     if object_key == 'ticket':
-        priority_counts = {prio: 0 for prio in Ticket.DEFAULT_PRIORITIES}
-        for row in qs.values('priority').annotate(cnt=Count('id')):
-            priority_counts[row['priority']] = row['cnt']
-        return {
-            'open_count': qs.filter(status__in=('New', 'Open', 'Pending')).count(),
-            'resolved_count': qs.filter(status__in=('Resolved', 'Closed')).count(),
-            'priority_counts': priority_counts,
-        }
+        result = {}
+        if _is_field_visible(user, workspace, 'ticket', 'status'):
+            result['open_count'] = qs.filter(status__in=('New', 'Open', 'Pending')).count()
+            result['resolved_count'] = qs.filter(status__in=('Resolved', 'Closed')).count()
+        if _is_field_visible(user, workspace, 'ticket', 'priority'):
+            priority_counts = {prio: 0 for prio in Ticket.DEFAULT_PRIORITIES}
+            for row in qs.values('priority').annotate(cnt=Count('id')):
+                priority_counts[row['priority']] = row['cnt']
+            result['priority_counts'] = priority_counts
+        return result
     return {}
 
 
 def get_crm_record_detail(workspace, user, object_key: str, record_id: int) -> dict:
     """Fetch a single CRM record with linked summaries and activities."""
     ensure_object_permission(user, workspace, object_key, 'read')
-    record = _build_base_queryset(workspace, object_key).filter(id=record_id).first()
+    record = _build_base_queryset(workspace, object_key, user=user).filter(id=record_id).first()
     if record is None:
         raise CrmDomainError(f'{OBJECTS_BY_KEY[object_key].label} not found.', status_code=404)
     permissions_payload = {
@@ -1216,11 +1647,14 @@ def get_crm_record_detail(workspace, user, object_key: str, record_id: int) -> d
         'can_read': True,
         'can_update': user_has_object_right(user, workspace, object_key, 'update'),
         'can_delete': user_has_object_right(user, workspace, object_key, 'delete'),
+        'can_manage_sharing': user_can_manage_record_sharing(user, workspace, record),
+        'field_rights': get_user_field_rights(user, workspace, object_key),
         'activity': {
             'can_create': user_has_object_right(user, workspace, 'activity', 'create'),
             'can_read': user_has_object_right(user, workspace, 'activity', 'read'),
             'can_update': user_has_object_right(user, workspace, 'activity', 'update'),
             'can_delete': user_has_object_right(user, workspace, 'activity', 'delete'),
+            'field_rights': get_user_field_rights(user, workspace, 'activity'),
         },
     }
     if object_key in ('lead', 'deal'):
@@ -1243,7 +1677,14 @@ def get_crm_record_detail(workspace, user, object_key: str, record_id: int) -> d
 def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
     """Validate and create a new S2.1 CRM record with audit logging."""
     ensure_object_permission(user, workspace, object_key, 'create')
+    _ensure_writable_fields(user, workspace, object_key, payload, is_create=True)
     user_tz = getattr(user, 'timezone', 'Africa/Accra') or 'Africa/Accra'
+    visibility, shared_role, _ = _resolve_sharing_fields(
+        workspace,
+        payload,
+        existing=None,
+        user=user,
+    )
 
     with transaction.atomic():
         if object_key == 'account':
@@ -1252,6 +1693,8 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
                 workspace=workspace,
                 owner=user,
                 created_by=user,
+                visibility=visibility,
+                shared_role=shared_role,
                 name=name,
                 city=_parse_optional_str(payload, 'city', label='City', max_length=120),
                 phone=_parse_optional_str(payload, 'phone', label='Phone', max_length=64),
@@ -1266,11 +1709,13 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
                 label=_get_contact_screen_label(workspace) + ' name',
                 max_length=255,
             )
-            account, _ = _resolve_account(workspace, payload)
+            account, _ = _resolve_account(workspace, payload, user=user)
             record = Contact.objects.create(
                 workspace=workspace,
                 owner=user,
                 created_by=user,
+                visibility=visibility,
+                shared_role=shared_role,
                 account=account,
                 name=name,
                 title=_parse_optional_str(payload, 'title', label='Title', max_length=150),
@@ -1289,13 +1734,15 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
             raw_status = payload.get('status')
             if raw_status is not None and str(raw_status).strip().lower() != Lead.STATUS_OPEN:
                 raise CrmDomainError(
-                    'New leads start as open. Lead conversion is not part of this workflow.',
+                    'New leads start as open. Use lead conversion to convert a lead.',
                     status_code=400,
                 )
             record = Lead.objects.create(
                 workspace=workspace,
                 owner=user,
                 created_by=user,
+                visibility=visibility,
+                shared_role=shared_role,
                 name=name,
                 company=_parse_optional_str(payload, 'company', label='Company', max_length=255),
                 email=_parse_optional_email(payload, 'email'),
@@ -1311,9 +1758,13 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
 
         elif object_key == 'deal':
             title = _parse_required_str(payload, 'title', 'name', label='Deal title', max_length=255)
-            account, contact = _resolve_account_and_contact_pair(workspace, payload)
-            stage_raw = payload.get('stage', 'New')
-            stage = _validate_choice(stage_raw, Deal.DEFAULT_STAGES, field_name='Stage')
+            account, contact = _resolve_account_and_contact_pair(workspace, payload, user=user)
+            stage_obj = resolve_deal_stage(
+                workspace,
+                payload.get('stage'),
+                stage_id=_first_present(payload, 'stage_id', 'pipeline_stage_id'),
+                allow_default=True,
+            )
             amount = _parse_decimal(
                 payload.get('amount'),
                 field_name='Amount',
@@ -1324,11 +1775,15 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
                 workspace=workspace,
                 owner=user,
                 created_by=user,
+                visibility=visibility,
+                shared_role=shared_role,
+                pipeline=stage_obj.pipeline,
+                pipeline_stage=stage_obj,
                 title=title,
                 account=account,
                 contact=contact,
                 amount=amount,
-                stage=stage,
+                stage=stage_obj.name,
                 target_close_date=_parse_optional_date(
                     payload.get('target_close_date'),
                     field_name='Target close date',
@@ -1350,7 +1805,7 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
 
         elif object_key == 'job':
             title = _parse_required_str(payload, 'title', 'name', label='Job title', max_length=255)
-            account, contact = _resolve_account_and_contact_pair(workspace, payload)
+            account, contact = _resolve_account_and_contact_pair(workspace, payload, user=user)
             if account is None and contact is None:
                 contact_label = _get_contact_screen_label(workspace)
                 raise CrmDomainError(
@@ -1367,6 +1822,8 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
                 workspace=workspace,
                 owner=user,
                 created_by=user,
+                visibility=visibility,
+                shared_role=shared_role,
                 title=title,
                 status=status,
                 assignee=assignee,
@@ -1378,7 +1835,7 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
 
         elif object_key == 'appointment':
             contact_label = _get_contact_screen_label(workspace)
-            contact, _ = _resolve_contact(workspace, payload)
+            contact, _ = _resolve_contact(workspace, payload, user=user)
             if contact is None:
                 raise CrmDomainError(
                     f'An Appointment must link to a {contact_label}.',
@@ -1407,6 +1864,8 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
                 workspace=workspace,
                 owner=user,
                 created_by=user,
+                visibility=visibility,
+                shared_role=shared_role,
                 title=title,
                 scheduled_at=scheduled_at,
                 status=status,
@@ -1423,7 +1882,7 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
                 label='Ticket title',
                 max_length=255,
             )
-            account, contact = _resolve_account_and_contact_pair(workspace, payload)
+            account, contact = _resolve_account_and_contact_pair(workspace, payload, user=user)
             status = _validate_choice(
                 payload.get('status', 'New'),
                 Ticket.DEFAULT_STATUSES,
@@ -1439,6 +1898,8 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
                 workspace=workspace,
                 owner=user,
                 created_by=user,
+                visibility=visibility,
+                shared_role=shared_role,
                 title=title,
                 status=status,
                 priority=priority,
@@ -1495,6 +1956,8 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
                 workspace=workspace,
                 owner=user,
                 created_by=user,
+                visibility=visibility,
+                shared_role=shared_role,
                 activity_type=act_type,
                 target_object_type=target_type,
                 target_object_id=target_id,
@@ -1518,7 +1981,7 @@ def create_crm_record(workspace, user, object_key: str, payload: dict) -> dict:
             actor_user=user,
         )
 
-    fresh = _build_base_queryset(workspace, object_key).get(pk=record.pk)
+    fresh = _build_base_queryset(workspace, object_key, user=user).get(pk=record.pk)
     return {
         'record': serialize_crm_record(
             fresh,
@@ -1545,19 +2008,32 @@ def _apply_field_update(record, field_name: str, new_value, changes: list[tuple[
 def update_crm_record(workspace, user, object_key: str, record_id: int, payload: dict) -> dict:
     """Validate and update a CRM record with per-field audit logging."""
     ensure_object_permission(user, workspace, object_key, 'update')
+    _ensure_writable_fields(user, workspace, object_key, payload, is_create=False)
     user_tz = getattr(user, 'timezone', 'Africa/Accra') or 'Africa/Accra'
     model_cls = CRM_MODELS_BY_KEY[object_key]
 
     with transaction.atomic():
         record = (
             model_cls.objects.select_for_update(of=('self',))
+            .select_related('shared_role')
             .filter(workspace=workspace, id=record_id)
             .first()
         )
-        if record is None:
+        if record is None or not user_can_see_record(user, workspace, record):
             raise CrmDomainError(f'{OBJECTS_BY_KEY[object_key].label} not found.', status_code=404)
 
         changes: list[tuple[str, object, object]] = []
+        link_synced = False
+
+        if _has_any_key(payload, 'visibility', 'shared_role_id', 'shared_role'):
+            next_visibility, next_shared_role, _ = _resolve_sharing_fields(
+                workspace,
+                payload,
+                existing=record,
+                user=user,
+            )
+            _apply_field_update(record, 'visibility', next_visibility, changes)
+            _apply_field_update(record, 'shared_role', next_shared_role, changes)
 
         if object_key == 'account':
             if 'name' in payload:
@@ -1646,7 +2122,7 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                     changes,
                 )
             if _has_any_key(payload, 'account_id', 'account'):
-                next_account, _ = _resolve_account(workspace, payload, existing=record)
+                next_account, _ = _resolve_account(workspace, payload, existing=record, user=user)
                 old_account_id = record.account_id
                 next_account_id = next_account.id if next_account else None
                 if old_account_id is not None and next_account_id != old_account_id:
@@ -1702,8 +2178,9 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                 or next_phone != record.phone
                 or next_email != record.email
             ):
+                contact_label = _get_contact_screen_label(workspace)
                 raise CrmDomainError(
-                    'Name, company, email, and phone stay with the Account and Contact created from this converted lead.',
+                    f'Name, company, email, and phone stay with the Account and {contact_label} created from this converted lead.',
                     status_code=400,
                 )
             if 'name' in payload:
@@ -1744,11 +2221,24 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                     _parse_required_str(payload, 'title', 'name', label='Deal title', max_length=255),
                     changes,
                 )
-            if 'stage' in payload:
+            if _has_any_key(payload, 'stage', 'stage_id', 'pipeline_stage_id'):
+                stage_obj = resolve_deal_stage(
+                    workspace,
+                    payload.get('stage'),
+                    stage_id=_first_present(payload, 'stage_id', 'pipeline_stage_id'),
+                    allow_default=False,
+                )
+                if (
+                    record.pipeline_id != stage_obj.pipeline_id
+                    or record.pipeline_stage_id != stage_obj.id
+                ):
+                    record.pipeline = stage_obj.pipeline
+                    record.pipeline_stage = stage_obj
+                    link_synced = True
                 _apply_field_update(
                     record,
                     'stage',
-                    _validate_choice(payload.get('stage'), Deal.DEFAULT_STAGES, field_name='Stage'),
+                    stage_obj.name,
                     changes,
                 )
             if 'amount' in payload:
@@ -1809,6 +2299,7 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                     workspace,
                     payload,
                     existing=record,
+                    user=user,
                 )
                 _apply_field_update(record, 'account', next_account, changes)
                 _apply_field_update(record, 'contact', next_contact, changes)
@@ -1854,6 +2345,7 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                     workspace,
                     payload,
                     existing=record,
+                    user=user,
                 )
                 if next_account is None and next_contact is None:
                     contact_label = _get_contact_screen_label(workspace)
@@ -1904,7 +2396,7 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                     changes,
                 )
             if _has_any_key(payload, 'contact_id', 'contact'):
-                next_contact, _ = _resolve_contact(workspace, payload, existing=record)
+                next_contact, _ = _resolve_contact(workspace, payload, existing=record, user=user)
                 if next_contact is None:
                     raise CrmDomainError(
                         f'An Appointment must link to a {contact_label}.',
@@ -1980,6 +2472,7 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                     workspace,
                     payload,
                     existing=record,
+                    user=user,
                 )
                 _apply_field_update(record, 'account', next_account, changes)
                 _apply_field_update(record, 'contact', next_contact, changes)
@@ -2059,8 +2552,9 @@ def update_crm_record(workspace, user, object_key: str, record_id: int, payload:
                     changes,
                 )
 
-        if changes:
+        if changes or link_synced:
             record.save()
+        if changes:
             record_label = get_record_label(record, object_key)
             for field_name, prev_val, next_val in changes:
                 record_audit_event(
@@ -2106,7 +2600,7 @@ def delete_crm_record(workspace, user, object_key: str, record_id: int) -> dict:
             .filter(workspace=workspace, id=record_id)
             .first()
         )
-        if record is None:
+        if record is None or not user_can_see_record(user, workspace, record):
             raise CrmDomainError(f'{OBJECTS_BY_KEY[object_key].label} not found.', status_code=404)
 
         if object_key == 'account':
@@ -2173,7 +2667,10 @@ def delete_crm_record(workspace, user, object_key: str, record_id: int) -> dict:
 
 
 def get_crm_options(workspace, user) -> dict:
-    """Return workspace assignees, readable Accounts/Contacts summaries, and S2.1 choice constants."""
+    """Return workspace assignees, roles, readable Accounts/Contacts summaries, and choice constants."""
+    ensure_workspace_default_roles(workspace)
+    vis_q = build_record_visibility_q(user, workspace)
+
     assignees = [
         {
             'id': member.id,
@@ -2185,13 +2682,28 @@ def get_crm_options(workspace, user) -> dict:
         .order_by('email', 'id')
     ]
 
+    roles = [
+        {
+            'id': role.id,
+            'name': role.name,
+            'is_owner': bool(role.is_owner),
+            'is_default_staff': bool(role.is_default_staff),
+        }
+        for role in workspace.roles.order_by('-is_owner', '-is_default_staff', 'name', 'id')
+    ]
+
     accounts = []
     accounts_total_count = 0
     if _is_enabled_and_readable(user, workspace, 'account'):
-        acc_qs = Account.objects.filter(workspace=workspace).order_by('name', 'id')
+        acc_qs = Account.objects.filter(workspace=workspace).filter(vis_q).order_by('name', 'id')
         accounts_total_count = acc_qs.count()
+        show_acc_city = _is_field_visible(user, workspace, 'account', 'city')
         accounts = [
-            {'id': acc.id, 'name': acc.name, 'city': acc.city}
+            {
+                'id': acc.id,
+                'name': _get_visible_record_label(acc, 'account', user=user, workspace=workspace),
+                **({'city': acc.city} if show_acc_city else {}),
+            }
             for acc in acc_qs[:250]
         ]
 
@@ -2201,23 +2713,38 @@ def get_crm_options(workspace, user) -> dict:
         con_qs = (
             Contact.objects.select_related('account')
             .filter(workspace=workspace)
+            .filter(vis_q)
             .order_by('name', 'id')
         )
         contacts_total_count = con_qs.count()
-        contacts = [
-            {
+        show_con_email = _is_field_visible(user, workspace, 'contact', 'email')
+        show_con_account = _is_field_visible(user, workspace, 'contact', 'account')
+        contacts = []
+        for con in con_qs[:250]:
+            item = {
                 'id': con.id,
-                'name': con.name,
-                'email': con.email,
-                'account_id': con.account_id,
-                'account_name': con.account.name if con.account else '',
+                'name': _get_visible_record_label(con, 'contact', user=user, workspace=workspace),
             }
-            for con in con_qs[:250]
-        ]
+            if show_con_email:
+                item['email'] = con.email
+            if show_con_account and con.account_id and con.account and user_can_see_record(user, workspace, con.account):
+                item['account_id'] = con.account_id
+                item['account_name'] = _get_visible_record_label(con.account, 'account', user=user, workspace=workspace)
+            else:
+                item['account_id'] = None
+                item['account_name'] = ''
+            contacts.append(item)
 
     conversion_cap = get_lead_conversion_capability(user, workspace)
+    pipeline = ensure_workspace_pipeline(workspace, require_enabled=False)
+    pipeline_stages = (
+        list(PipelineStage.objects.filter(pipeline=pipeline).order_by('position', 'id'))
+        if pipeline is not None
+        else []
+    )
     return {
         'assignees': assignees,
+        'roles': roles,
         'accounts': accounts,
         'accounts_total_count': accounts_total_count,
         'accounts_truncated': accounts_total_count > len(accounts),
@@ -2227,7 +2754,13 @@ def get_crm_options(workspace, user) -> dict:
         'lead_conversion_available': conversion_cap['conversion_available'],
         'can_convert_lead': conversion_cap['can_convert_lead'],
         'constants': {
-            'deal_stages': list(Deal.DEFAULT_STAGES),
+            'pipeline': (
+                {'id': pipeline.id, 'name': pipeline.name}
+                if pipeline is not None
+                else None
+            ),
+            'deal_stages': [stage.name for stage in pipeline_stages],
+            'deal_pipeline_stages': [serialize_pipeline_stage(stage) for stage in pipeline_stages],
             'job_statuses': list(Job.DEFAULT_STATUSES),
             'appointment_statuses': list(Appointment.DEFAULT_STATUSES),
             'ticket_statuses': list(Ticket.DEFAULT_STATUSES),
@@ -2238,8 +2771,9 @@ def get_crm_options(workspace, user) -> dict:
 
 
 def get_workspace_dashboard_summary(workspace, user) -> dict:
-    """Return role- and pack-aware S2.1 record counts, pipeline metrics, and recent records."""
+    """Return role-, visibility-, and pack-aware record counts, pipeline metrics, and recent records."""
     ensure_workspace_catalog(workspace)
+    vis_q = build_record_visibility_q(user, workspace)
     enabled_keys = set(
         WorkspaceTable.objects.filter(workspace=workspace, is_enabled=True)
         .values_list('object_key', flat=True)
@@ -2251,11 +2785,17 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
         for obj_key in s21_keys
         if obj_key in enabled_keys and user_has_object_right(user, workspace, obj_key, 'read')
     ]
-    counts_by_object = (
-        get_workspace_table_record_counts(workspace, readable_object_keys)
-        if readable_object_keys
-        else {}
-    )
+    if is_workspace_owner(user, workspace):
+        counts_by_object = (
+            get_workspace_table_record_counts(workspace, readable_object_keys)
+            if readable_object_keys
+            else {}
+        )
+    else:
+        counts_by_object = {
+            obj_key: CRM_MODELS_BY_KEY[obj_key].objects.filter(workspace=workspace).filter(vis_q).count()
+            for obj_key in readable_object_keys
+        }
     total_records = sum(counts_by_object.values())
 
     open_counts: dict[str, int] = {}
@@ -2263,43 +2803,36 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
         open_counts['lead_open'] = Lead.objects.filter(
             workspace=workspace,
             status=Lead.STATUS_OPEN,
-        ).count()
+        ).filter(vis_q).count()
     if 'job' in readable_object_keys:
         open_counts['job_open'] = Job.objects.filter(
             workspace=workspace,
             status__in=('Pending', 'In Progress'),
-        ).count()
+        ).filter(vis_q).count()
     if 'appointment' in readable_object_keys:
         open_counts['appointment_upcoming'] = Appointment.objects.filter(
             workspace=workspace,
             status__in=('Scheduled', 'Confirmed'),
-        ).count()
+        ).filter(vis_q).count()
     if 'ticket' in readable_object_keys:
         open_counts['ticket_open'] = Ticket.objects.filter(
             workspace=workspace,
             status__in=('New', 'Open', 'Pending'),
-        ).count()
+        ).filter(vis_q).count()
     if 'activity' in readable_object_keys:
         open_counts['task_open'] = Activity.objects.filter(
             workspace=workspace,
             activity_type=Activity.TYPE_TASK,
             is_completed=False,
-        ).count()
+        ).filter(vis_q).count()
 
     deal_summary = None
     if 'deal' in readable_object_keys:
-        deal_qs = Deal.objects.filter(workspace=workspace)
-        total_amount = deal_qs.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-        stage_counts = {stage: 0 for stage in Deal.DEFAULT_STAGES}
-        stage_amounts = {stage: '0.00' for stage in Deal.DEFAULT_STAGES}
-        for row in deal_qs.values('stage').annotate(cnt=Count('id'), val=Sum('amount')):
-            stage_counts[row['stage']] = row['cnt']
-            stage_amounts[row['stage']] = f"{(row['val'] or Decimal('0.00')):.2f}"
+        deal_qs = Deal.objects.filter(workspace=workspace).filter(vis_q)
+        stage_summary = _build_deal_stage_summary(workspace, deal_qs, user=user)
         deal_summary = {
             'total_count': counts_by_object.get('deal', 0),
-            'total_amount': f'{total_amount:.2f}',
-            'stage_counts': stage_counts,
-            'stage_amounts': stage_amounts,
+            **stage_summary,
         }
 
     recent_candidates: list[tuple[datetime, dict]] = []
@@ -2316,27 +2849,50 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
         if obj_key not in readable_object_keys:
             continue
         model_cls = CRM_MODELS_BY_KEY[obj_key]
-        rows = model_cls.objects.filter(workspace=workspace).order_by('-updated_at', '-id')[:4]
+        rows = (
+            model_cls.objects.filter(workspace=workspace)
+            .filter(vis_q)
+            .order_by('-updated_at', '-id')[:4]
+        )
         for row in rows:
-            meta = ''
+            meta_parts: list[str] = []
             if obj_key == 'account':
-                meta = row.city or row.email or 'Account'
-            elif obj_key == 'contact':
-                meta = row.title or row.email or _get_contact_screen_label(workspace)
-            elif obj_key == 'lead':
-                if row.status == Lead.STATUS_CONVERTED:
-                    meta = f'{row.company} · Converted' if row.company else 'Converted'
+                if _is_field_visible(user, workspace, 'account', 'city') and row.city:
+                    meta_parts.append(row.city)
+                elif _is_field_visible(user, workspace, 'account', 'email') and row.email:
+                    meta_parts.append(row.email)
                 else:
-                    meta = row.company or row.status.title()
+                    meta_parts.append('Account')
+            elif obj_key == 'contact':
+                if _is_field_visible(user, workspace, 'contact', 'title') and row.title:
+                    meta_parts.append(row.title)
+                elif _is_field_visible(user, workspace, 'contact', 'email') and row.email:
+                    meta_parts.append(row.email)
+                else:
+                    meta_parts.append(_get_contact_screen_label(workspace))
+            elif obj_key == 'lead':
+                if _is_field_visible(user, workspace, 'lead', 'company') and row.company:
+                    meta_parts.append(row.company)
+                if _is_field_visible(user, workspace, 'lead', 'status'):
+                    meta_parts.append('Converted' if row.status == Lead.STATUS_CONVERTED else row.status.title())
             elif obj_key == 'deal':
-                meta = f'{row.stage} · GHS {row.amount:.2f}'
+                if _is_field_visible(user, workspace, 'deal', 'stage'):
+                    meta_parts.append(row.stage)
+                if _is_field_visible(user, workspace, 'deal', 'amount'):
+                    meta_parts.append(f'GHS {row.amount:.2f}')
             elif obj_key == 'job':
-                meta = row.status
+                if _is_field_visible(user, workspace, 'job', 'status'):
+                    meta_parts.append(row.status)
             elif obj_key == 'appointment':
-                meta = row.status
+                if _is_field_visible(user, workspace, 'appointment', 'status'):
+                    meta_parts.append(row.status)
             elif obj_key == 'ticket':
-                meta = f'{row.status} · {row.priority}'
+                if _is_field_visible(user, workspace, 'ticket', 'status'):
+                    meta_parts.append(row.status)
+                if _is_field_visible(user, workspace, 'ticket', 'priority'):
+                    meta_parts.append(row.priority)
 
+            meta = ' · '.join(meta_parts) or OBJECTS_BY_KEY[obj_key].label
             recent_candidates.append(
                 (
                     row.updated_at,
@@ -2345,7 +2901,7 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
                         'object_key': obj_key,
                         'pane_id': pane_id,
                         'record_code': f'{RECORD_CODE_PREFIXES[obj_key]}-{row.id}',
-                        'display_label': get_record_label(row, obj_key),
+                        'display_label': _get_visible_record_label(row, obj_key, user=user, workspace=workspace),
                         'meta': meta,
                         'updated_at': row.updated_at.isoformat(),
                     },
@@ -2362,4 +2918,73 @@ def get_workspace_dashboard_summary(workspace, user) -> dict:
         'open_counts': open_counts,
         'deal_summary': deal_summary,
         'recent_records': recent_records,
+    }
+
+
+def get_deals_board(
+    workspace,
+    user,
+    *,
+    query_params,
+    per_stage_limit: int = DEFAULT_BOARD_PER_STAGE_LIMIT,
+) -> dict:
+    """Return ordered pipeline columns with per-stage bounded Deal slices and SQL totals."""
+    ensure_object_permission(user, workspace, 'deal', 'read')
+    pipeline = ensure_workspace_pipeline(workspace, require_enabled=True)
+    stages = list(PipelineStage.objects.filter(pipeline=pipeline).order_by('position', 'id'))
+
+    base_qs = _apply_deal_filters(
+        _build_base_queryset(workspace, 'deal', user=user),
+        query_params,
+        include_stage=False,
+        user=user,
+        workspace=workspace,
+    )
+    summary = _build_deal_stage_summary(workspace, base_qs, user=user)
+    total_count = base_qs.count()
+    amount_visible = _is_field_visible(user, workspace, 'deal', 'amount')
+
+    columns = []
+    for stage in stages:
+        col_qs = base_qs.filter(
+            Q(pipeline_stage=stage)
+            | Q(pipeline_stage__isnull=True, stage__iexact=stage.name)
+        )
+        col_deals = list(col_qs[:per_stage_limit])
+        col_count = summary['stage_counts'].get(stage.name, 0) if summary['stage_counts'] else col_qs.count()
+        col_amount = summary['stage_amounts'].get(stage.name, '0.00') if amount_visible else None
+        columns.append(
+            {
+                **serialize_pipeline_stage(stage),
+                'deal_count': col_count,
+                'total_amount': col_amount,
+                'has_more': col_count > len(col_deals),
+                'deals': [
+                    serialize_crm_record(deal, 'deal', user=user, workspace=workspace)
+                    for deal in col_deals
+                ],
+            }
+        )
+
+    conversion_cap = get_lead_conversion_capability(user, workspace)
+    return {
+        'pipeline': {
+            'id': pipeline.id,
+            'name': pipeline.name,
+            'is_default': bool(pipeline.is_default),
+        },
+        'stages': columns,
+        'total_count': total_count,
+        'per_stage_limit': per_stage_limit,
+        'summary': summary,
+        'permissions': {
+            'can_create': user_has_object_right(user, workspace, 'deal', 'create'),
+            'can_read': True,
+            'can_update': user_has_object_right(user, workspace, 'deal', 'update'),
+            'can_delete': user_has_object_right(user, workspace, 'deal', 'delete'),
+            'can_manage_sales_settings': user_can_manage_sales_settings(user, workspace),
+            'conversion_available': conversion_cap['conversion_available'],
+            'can_convert_lead': conversion_cap['can_convert_lead'],
+            'field_rights': get_user_field_rights(user, workspace, 'deal'),
+        },
     }

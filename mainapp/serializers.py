@@ -1,16 +1,19 @@
 from .models import PasskeyCredential, Role, User, Workspace, WorkspaceInvite
 from .service.catalog_service import serialize_workspace_catalog_summary
 from .service.role_service import (
+    compute_user_permissions_version,
     count_active_seats,
     is_workspace_owner,
+    normalize_role_field_rights,
     normalize_role_object_rights,
+    user_can_manage_sales_settings,
     user_can_manage_users_and_roles,
     user_can_manage_workspace_catalog,
 )
 
 
 def serialize_user_role_summary(role: Role | None, *, is_owner_fallback: bool = False) -> dict:
-    """Serialize a compact role summary for user and member payloads."""
+    """Serialize a compact role summary for user, invite, and member payloads."""
     if role is not None:
         return {
             'id': role.id,
@@ -31,8 +34,9 @@ def serialize_role(
     *,
     member_count: int | None = None,
     active_member_count: int | None = None,
+    shared_record_count: int | None = None,
 ) -> dict:
-    """Serialize a workspace Role including its capabilities and seven PRD switches."""
+    """Serialize a workspace Role including its capabilities, switches, object rights, and field rights."""
     data = {
         'id': role.id,
         'name': role.name,
@@ -45,12 +49,15 @@ def serialize_role(
         'can_manage_sms_wallet': bool(role.can_manage_sms_wallet),
         'switches': role.switches_dict(),
         'object_rights': normalize_role_object_rights(role),
+        'field_rights': normalize_role_field_rights(role),
         'created_at': role.created_at.isoformat(),
     }
     if member_count is not None:
         data['member_count'] = member_count
     if active_member_count is not None:
         data['active_member_count'] = active_member_count
+    if shared_record_count is not None:
+        data['shared_record_count'] = shared_record_count
     return data
 
 
@@ -59,6 +66,7 @@ def serialize_workspace_and_user(workspace: Workspace, user: User) -> dict:
     is_owner = is_workspace_owner(user, workspace)
     can_manage_users = user_can_manage_users_and_roles(user, workspace)
     can_manage_catalog = user_can_manage_workspace_catalog(user, workspace)
+    can_manage_sales = user_can_manage_sales_settings(user, workspace)
     role = getattr(user, 'role', None)
     role_summary = serialize_user_role_summary(role, is_owner_fallback=is_owner)
     switches = (
@@ -74,6 +82,7 @@ def serialize_workspace_and_user(workspace: Workspace, user: User) -> dict:
             'unattended_agent': is_owner,
         }
     )
+    permissions_version = compute_user_permissions_version(user, workspace)
 
     return {
         'workspace': {
@@ -88,17 +97,22 @@ def serialize_workspace_and_user(workspace: Workspace, user: User) -> dict:
         },
         'active_seat_count': count_active_seats(workspace),
         'role': role_summary,
+        'permissions_version': permissions_version,
         'permissions': {
             'is_owner': is_owner,
             'can_manage_invites': can_manage_users,
             'can_manage_users_and_roles': can_manage_users,
             'can_manage_packs': can_manage_catalog,
             'can_manage_workspace_profile': can_manage_catalog,
+            'can_manage_sales_settings': can_manage_sales,
             'can_manage_seat_plan': is_owner,
             'can_manage_sms_wallet': is_owner,
+            'role_id': role_summary['id'],
             'role_name': role_summary['name'],
             'switches': switches,
             'object_rights': normalize_role_object_rights(role, is_owner_fallback=is_owner),
+            'field_rights': normalize_role_field_rights(role, is_owner_fallback=is_owner),
+            'permissions_version': permissions_version,
         },
         'mailbox_connection': {
             'connected': False,
@@ -127,10 +141,12 @@ def serialize_member(member: User, workspace: Workspace) -> dict:
 
 
 def serialize_invite(invite: WorkspaceInvite, now=None) -> dict:
-    """Serialize a workspace invitation row."""
+    """Serialize a workspace invitation row including its assigned role."""
+    role = getattr(invite, 'role', None)
     return {
         'id': invite.id,
         'email': invite.email,
+        'role': serialize_user_role_summary(role, is_owner_fallback=False),
         'status': invite.current_status(now=now),
         'invited_by_email': invite.invited_by.email if invite.invited_by else None,
         'last_sent_at': invite.last_sent_at.isoformat() if invite.last_sent_at else None,

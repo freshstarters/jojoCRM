@@ -343,6 +343,10 @@ def enable_pack_for_workspace(workspace, pack_key: str, *, actor_user) -> dict:
                 newly_enabled_keys.append(obj_key)
 
         if pack_created or newly_enabled_keys:
+            if 'deal' in newly_enabled_keys:
+                from .pipeline_service import ensure_workspace_pipeline
+
+                ensure_workspace_pipeline(workspace, require_enabled=False)
             record_audit_event(
                 workspace=workspace,
                 object_type='workspace_pack',
@@ -449,6 +453,10 @@ def set_workspace_table_enabled(
             changed = False
 
         if changed:
+            if normalized_key == 'deal':
+                from .pipeline_service import ensure_workspace_pipeline
+
+                ensure_workspace_pipeline(workspace, require_enabled=False)
             record_audit_event(
                 workspace=workspace,
                 object_type='workspace_table',
