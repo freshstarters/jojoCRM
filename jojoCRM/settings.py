@@ -10,9 +10,11 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
 import decouple
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -243,6 +245,102 @@ WEBAUTHN_RP_NAME = (
 WEBAUTHN_ORIGIN = (
     _clean_env_str(decouple.config('WEBAUTHN_ORIGIN', default=''))
     or APP_BASE_URL
+)
+
+
+# Caching (Redis default; fail closed in production if unconfigured)
+def _parse_positive_int_env(name: str, default: int) -> int:
+    raw = _clean_env_str(decouple.config(name, default=str(default)))
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ImproperlyConfigured(f'{name} must be a positive integer.') from exc
+    if parsed <= 0:
+        raise ImproperlyConfigured(f'{name} must be a positive integer.')
+    return parsed
+
+
+def build_cache_settings(
+    *,
+    debug: bool,
+    running_tests: bool = False,
+    cache_backend: str = '',
+    redis_url: str = '',
+    cache_location: str = '',
+    cache_key_prefix: str = 'jojocrm',
+    cache_default_timeout: int = 300,
+    allow_local_memory_cache: bool = False,
+) -> dict:
+    """Build Django CACHES config, failing closed when DEBUG=False lacks shared cache config."""
+    clean_backend = _clean_env_str(cache_backend)
+    clean_location = _clean_env_str(cache_location) or _clean_env_str(redis_url)
+    clean_prefix = _clean_env_str(cache_key_prefix) or 'jojocrm'
+
+    if running_tests and not clean_backend:
+        return {
+            'default': {
+                'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+                'LOCATION': 'jojocrm-test',
+                'KEY_PREFIX': f'{clean_prefix}-test',
+                'TIMEOUT': cache_default_timeout,
+            }
+        }
+
+    backend = clean_backend or 'django.core.cache.backends.redis.RedisCache'
+    is_local_or_dummy = backend.endswith('.LocMemCache') or backend.endswith('.DummyCache')
+
+    if not debug:
+        if is_local_or_dummy and not allow_local_memory_cache:
+            raise ImproperlyConfigured(
+                'LocMemCache and DummyCache are disallowed when DEBUG=False unless '
+                'ALLOW_LOCAL_MEMORY_CACHE=True.'
+            )
+        if not is_local_or_dummy and not clean_location:
+            raise ImproperlyConfigured(
+                'REDIS_URL or CACHE_LOCATION must be configured when DEBUG=False.'
+            )
+    else:
+        if backend == 'django.core.cache.backends.redis.RedisCache' and not clean_location:
+            clean_location = 'redis://127.0.0.1:6379/1'
+        elif is_local_or_dummy and not clean_location:
+            clean_location = 'jojocrm-default'
+
+    config: dict = {
+        'BACKEND': backend,
+        'KEY_PREFIX': clean_prefix,
+        'TIMEOUT': cache_default_timeout,
+    }
+    if clean_location:
+        config['LOCATION'] = clean_location
+    if backend == 'django.core.cache.backends.redis.RedisCache':
+        config['OPTIONS'] = {
+            'socket_connect_timeout': 1,
+            'socket_timeout': 1,
+        }
+    return {'default': config}
+
+
+RUNNING_TESTS = (len(sys.argv) > 1 and sys.argv[1] == 'test') or ('pytest' in sys.modules)
+REDIS_URL = _clean_env_str(decouple.config('REDIS_URL', default=''))
+CACHE_BACKEND = _clean_env_str(decouple.config('CACHE_BACKEND', default=''))
+CACHE_LOCATION = _clean_env_str(decouple.config('CACHE_LOCATION', default=''))
+CACHE_KEY_PREFIX = _clean_env_str(decouple.config('CACHE_KEY_PREFIX', default='jojocrm')) or 'jojocrm'
+CACHE_DEFAULT_TIMEOUT = _parse_positive_int_env('CACHE_DEFAULT_TIMEOUT', 300)
+ALLOW_LOCAL_MEMORY_CACHE = decouple.config('ALLOW_LOCAL_MEMORY_CACHE', default=False, cast=bool)
+STATIC_CATALOG_CACHE_TTL = _parse_positive_int_env('STATIC_CATALOG_CACHE_TTL', 86400)
+WORKSPACE_CACHE_TTL = _parse_positive_int_env('WORKSPACE_CACHE_TTL', 300)
+
+CACHES = build_cache_settings(
+    debug=DEBUG,
+    running_tests=RUNNING_TESTS,
+    cache_backend=CACHE_BACKEND,
+    redis_url=REDIS_URL,
+    cache_location=CACHE_LOCATION,
+    cache_key_prefix=CACHE_KEY_PREFIX,
+    cache_default_timeout=CACHE_DEFAULT_TIMEOUT,
+    allow_local_memory_cache=ALLOW_LOCAL_MEMORY_CACHE,
 )
 
 
