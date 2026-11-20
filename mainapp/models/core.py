@@ -441,6 +441,21 @@ class AuditLog(models.Model):
     field_name = models.CharField(max_length=120)
     previous_value = models.JSONField(null=True, blank=True)
     new_value = models.JSONField(null=True, blank=True)
+    record_visibility = models.CharField(max_length=20, blank=True, default='')
+    record_owner = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='owned_record_audit_logs',
+    )
+    record_shared_role = models.ForeignKey(
+        Role,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='shared_role_audit_logs',
+    )
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
 
     class Meta:
@@ -453,6 +468,10 @@ class AuditLog(models.Model):
             models.Index(
                 fields=['workspace', 'object_type', 'object_id', '-created_at'],
                 name='audit_ws_object_idx',
+            ),
+            models.Index(
+                fields=['workspace', 'object_type', 'action', '-created_at'],
+                name='audit_ws_type_act_idx',
             ),
         ]
 

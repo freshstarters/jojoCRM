@@ -22,6 +22,7 @@ from .crm import (
     Pipeline,
     PipelineStage,
     Ticket,
+    Visit,
     WorkspaceRecordBase,
 )
 
@@ -43,6 +44,7 @@ __all__ = [
     'Ticket',
     'User',
     'UserManager',
+    'Visit',
     'Workspace',
     'WorkspaceInvite',
     'WorkspacePack',

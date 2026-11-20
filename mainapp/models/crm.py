@@ -422,6 +422,41 @@ class Appointment(WorkspaceRecordBase):
         return f"{self.title} ({self.workspace_id})"
 
 
+class Visit(WorkspaceRecordBase):
+    """Pack healthcare meeting record storing date, reason, notes, and follow-up for a Patient."""
+
+    OBJECT_KEY = 'visit'
+
+    contact = models.ForeignKey(
+        Contact,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='visits',
+    )
+    date = models.DateTimeField()
+    reason = models.CharField(max_length=255)
+    notes = models.TextField(blank=True, default='')
+    follow_up = models.TextField(blank=True, default='')
+    assignee = models.ForeignKey(
+        'mainapp.User',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='assigned_visits',
+    )
+
+    class Meta:
+        ordering = ['-date', '-id']
+        indexes = [
+            models.Index(fields=['workspace', '-date'], name='vis_ws_date_idx'),
+            models.Index(fields=['workspace', 'contact'], name='vis_ws_contact_idx'),
+        ]
+
+    def __str__(self):
+        return f"{self.reason} ({self.workspace_id})"
+
+
 class Ticket(WorkspaceRecordBase):
     """Pack support case linked to an Account and/or Contact."""
 
@@ -489,6 +524,7 @@ class Activity(WorkspaceRecordBase):
         'deal',
         'job',
         'appointment',
+        'visit',
         'ticket',
     )
 

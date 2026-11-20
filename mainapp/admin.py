@@ -15,6 +15,7 @@ from .models import (
     Role,
     Ticket,
     User,
+    Visit,
     Workspace,
     WorkspaceInvite,
     WorkspacePack,
@@ -38,5 +39,6 @@ admin.site.register(Pipeline)
 admin.site.register(PipelineStage)
 admin.site.register(Job)
 admin.site.register(Appointment)
+admin.site.register(Visit)
 admin.site.register(Ticket)
 admin.site.register(Activity)
