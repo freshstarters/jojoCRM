@@ -164,6 +164,9 @@ class ResponseAndWorkspaceCachingTests(TestCase):
             self.assertEqual(second.status_code, 200)
             self.assertEqual(second["X-Cache"], "HIT")
             self.assertEqual(second["ETag"], etag)
+            self.assertEqual(second.get("Vary"), "Accept-Encoding")
+            self.assertNotIn("Cookie", second.get("Vary", ""))
+            self.assertGreaterEqual(len(second.json()["business_types"][0].get("starter_roles", [])), 3)
             self.assertEqual(second.json(), first_body)
 
             conditional_exact = self.client.get(
@@ -174,6 +177,7 @@ class ResponseAndWorkspaceCachingTests(TestCase):
             self.assertEqual(conditional_exact.content, b"")
             self.assertEqual(conditional_exact["ETag"], etag)
             self.assertEqual(conditional_exact["X-Cache"], "HIT")
+            self.assertNotIn("text/html", conditional_exact.get("Content-Type", ""))
             self.assertIn("public", conditional_exact["Cache-Control"])
 
             conditional_weak = self.client.get(
@@ -647,3 +651,36 @@ class ResponseAndWorkspaceCachingTests(TestCase):
             ["Shared Workspace Account"],
         )
         self.assertNotEqual(a_opts_hit["ETag"], b_opts_hit["ETag"])
+
+    def test_workspace_pipelines_endpoint_caches_with_etag_and_invalidates(self):
+        ws, _owner, _ = self._create_verified_workspace()
+
+        p1 = self.client.get(f"/api/v1/workspaces/{ws.slug}/pipelines/")
+        self.assertEqual(p1.status_code, 200)
+        self.assertEqual(p1["X-Cache"], "MISS")
+        etag = p1["ETag"]
+        self.assertEqual(p1["Vary"], "Cookie")
+
+        p2 = self.client.get(f"/api/v1/workspaces/{ws.slug}/pipelines/")
+        self.assertEqual(p2.status_code, 200)
+        self.assertEqual(p2["X-Cache"], "HIT")
+        self.assertEqual(p2["ETag"], etag)
+
+        p304 = self.client.get(
+            f"/api/v1/workspaces/{ws.slug}/pipelines/",
+            HTTP_IF_NONE_MATCH=etag,
+        )
+        self.assertEqual(p304.status_code, 304)
+
+        add_res = self.client.post(
+            f"/api/v1/workspaces/{ws.slug}/pipelines/stages/",
+            data=json.dumps({"name": "Technical Review", "tone": "indigo"}),
+            content_type="application/json",
+        )
+        self.assertEqual(add_res.status_code, 201)
+
+        p3 = self.client.get(f"/api/v1/workspaces/{ws.slug}/pipelines/")
+        self.assertEqual(p3.status_code, 200)
+        self.assertEqual(p3["X-Cache"], "MISS")
+        self.assertNotEqual(p3["ETag"], etag)
+        self.assertTrue(any(s["name"] == "Technical Review" for s in p3.json()["stages"]))

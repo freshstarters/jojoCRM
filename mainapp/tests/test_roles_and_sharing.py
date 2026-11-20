@@ -727,3 +727,54 @@ class S24RolesAndSharingTests(TestCase):
         self.assertNotIn('amount', ok_body['deal'])
         self.assertNotIn('email', ok_body['account'])
         self.assertNotIn('phone', ok_body['contact'])
+
+    def test_business_type_starter_roles_are_created_and_deletable(self):
+        from ..catalog import BUSINESS_TYPES
+        from ..service.catalog_service import initialize_workspace_catalog
+
+        # Every business type defines 3-5 unique starter roles distinct from Owner and Staff
+        for bt in BUSINESS_TYPES:
+            self.assertGreaterEqual(len(bt.starter_roles), 3, bt.key)
+            self.assertLessEqual(len(bt.starter_roles), 5, bt.key)
+            names_lower = [sr.name.lower() for sr in bt.starter_roles]
+            self.assertEqual(len(names_lower), len(set(names_lower)), bt.key)
+            self.assertNotIn('owner', names_lower, bt.key)
+            self.assertNotIn('staff', names_lower, bt.key)
+
+        ws = Workspace.objects.create(
+            name='Starter Roles Health Clinic',
+            slug='starter-roles-health',
+            business_type='healthcare_wellness',
+        )
+        initialize_workspace_catalog(ws, 'healthcare_wellness')
+        owner = User.objects.create_user(
+            email='owner@starter-roles-health.example.com',
+            workspace=ws,
+            password='OwnerPassword123!',
+            email_verified=True,
+            email_verified_at=timezone.now(),
+        )
+        ws.created_by = owner
+        ws.save(update_fields=['created_by'])
+        ensure_workspace_default_roles(ws)
+        owner.refresh_from_db()
+
+        roles_qs = Role.objects.filter(workspace=ws)
+        self.assertEqual(roles_qs.count(), 6)  # Owner + Staff + 4 starter roles
+
+        starter_role = roles_qs.filter(is_owner=False, is_default_staff=False).first()
+        self.assertIsNotNone(starter_role)
+        owner_client = self._logged_in_client(owner)
+
+        del_res = owner_client.delete(
+            f'/api/v1/workspaces/{ws.slug}/roles/{starter_role.id}/'
+        )
+        self.assertEqual(del_res.status_code, 200)
+
+        # Calling GET /roles/ or ensure_workspace_default_roles must NOT recreate a deleted starter role
+        roles_after = owner_client.get(f'/api/v1/workspaces/{ws.slug}/roles/')
+        self.assertEqual(roles_after.status_code, 200)
+        self.assertEqual(len(roles_after.json()['roles']), 5)
+        self.assertFalse(
+            Role.objects.filter(workspace=ws, id=starter_role.id).exists()
+        )
