@@ -1,7 +1,4 @@
-import math
-
 from django.db import transaction
-from django.db.models import Q
 from django.http import JsonResponse
 from django.views.decorators.http import require_GET, require_http_methods
 
@@ -14,9 +11,11 @@ from ..helpers.request_helpers import (
 from ..models import AuditLog, Workspace
 from ..serializers import serialize_workspace_and_user
 from ..service.audit_service import (
-    VALID_ACTOR_KINDS,
+    AuditQueryError,
+    DEFAULT_AUDIT_PAGE_SIZE,
+    MAX_AUDIT_PAGE_SIZE,
+    list_workspace_audit_entries,
     record_audit_event,
-    serialize_audit_entry,
 )
 from ..service.catalog_service import (
     CatalogError,
@@ -24,17 +23,7 @@ from ..service.catalog_service import (
     serialize_workspace_packs_detail,
     set_workspace_table_enabled,
 )
-from ..service.pipeline_service import is_deal_table_enabled
-from ..service.role_service import (
-    ALL_OBJECT_KEYS,
-    user_can_manage_users_and_roles,
-    user_can_manage_workspace_catalog,
-    user_has_object_right,
-)
-
-DEFAULT_AUDIT_PAGE_SIZE = 20
-MAX_AUDIT_PAGE_SIZE = 100
-PRIVATE_SECURITY_OBJECT_TYPES = ('workspace_invite', 'user', 'external_identity', 'passkey')
+from ..service.role_service import user_can_manage_workspace_catalog
 
 
 def _require_catalog_management_permission(request, slug: str):
@@ -269,7 +258,7 @@ def workspace_table_detail_view(request, slug: str, object_key: str):
 
 @require_GET
 def workspace_audit_view(request, slug: str):
-    """Return paginated audit log entries for the workspace, scoped by caller permissions."""
+    """Return paginated, filtered audit log entries scoped strictly by caller S2.4 permissions."""
     user, workspace, error_response = require_workspace_member(request, slug)
     if error_response is not None:
         return error_response
@@ -289,43 +278,17 @@ def workspace_audit_view(request, slug: str):
     if size_error is not None:
         return size_error
 
-    actor_kind = (request.GET.get('actor_kind') or '').strip().lower()
-    if actor_kind and actor_kind not in VALID_ACTOR_KINDS:
-        return JsonResponse({'error': 'Invalid actor_kind filter.'}, status=400)
-
-    qs = AuditLog.objects.filter(workspace=workspace)
-    if not user_can_manage_users_and_roles(user, workspace):
-        unreadable_crm_types = {
-            obj_key
-            for obj_key in ALL_OBJECT_KEYS
-            if not user_has_object_right(user, workspace, obj_key, 'read')
-        }
-        if 'deal' in unreadable_crm_types or not is_deal_table_enabled(workspace):
-            unreadable_crm_types.update({'pipeline', 'pipeline_stage'})
-        qs = qs.filter(
-            Q(actor_user=user)
-            | Q(object_type='user', object_id=str(user.id))
-            | ~Q(object_type__in=PRIVATE_SECURITY_OBJECT_TYPES)
-        ).exclude(object_type__in=unreadable_crm_types)
-
-    if actor_kind:
-        qs = qs.filter(actor_kind=actor_kind)
-
-    qs = qs.order_by('-created_at', '-id')
-    total_count = qs.count()
-    total_pages = max(1, math.ceil(total_count / page_size)) if total_count else 1
-    offset = (page - 1) * page_size
-    entries = list(qs[offset : offset + page_size])
-
-    return JsonResponse(
-        {
-            'results': [serialize_audit_entry(entry) for entry in entries],
-            'total_count': total_count,
-            'page': page,
-            'page_size': page_size,
-            'total_pages': total_pages,
-            'has_next': page < total_pages,
-            'has_previous': page > 1,
-        },
-        status=200,
-    )
+    try:
+        payload = list_workspace_audit_entries(
+            workspace,
+            user,
+            page=page,
+            page_size=page_size,
+            actor_kind=request.GET.get('actor_kind') or '',
+            object_type=request.GET.get('object_type') or '',
+            action=request.GET.get('action') or '',
+            q=request.GET.get('q') or '',
+        )
+        return JsonResponse(payload, status=200)
+    except AuditQueryError as exc:
+        return JsonResponse({'error': exc.message}, status=exc.status_code)
