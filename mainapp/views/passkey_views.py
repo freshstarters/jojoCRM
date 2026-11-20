@@ -77,11 +77,66 @@ def passkey_register_verify_view(request):
     return JsonResponse({"passkey": serialize_passkey(passkey)}, status=201)
 
 
-@require_http_methods(["DELETE"])
-def passkey_delete_view(request, passkey_id: int):
+@require_http_methods(["PATCH", "DELETE"])
+def passkey_detail_view(request, passkey_id: int):
+    """Rename (PATCH) or remove (DELETE) a passkey belonging to the signed-in user."""
     user, error_response = require_verified_user(request)
     if error_response is not None:
         return error_response
+
+    if request.method == "PATCH":
+        payload, parse_error = parse_json_object(request)
+        if parse_error is not None:
+            return parse_error
+
+        raw_name = payload.get("name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            return JsonResponse({"error": "Passkey label is required."}, status=400)
+        cleaned_name = " ".join(raw_name.strip().split())
+        if len(cleaned_name) > 100:
+            return JsonResponse(
+                {"error": "Passkey label must be 100 characters or fewer."},
+                status=400,
+            )
+
+        with transaction.atomic():
+            passkey = (
+                PasskeyCredential.objects.select_for_update()
+                .filter(id=passkey_id, user=user)
+                .first()
+            )
+            if passkey is None:
+                return JsonResponse({"error": "Passkey not found."}, status=404)
+            previous_name = passkey.name
+            changed = cleaned_name != previous_name
+            if changed:
+                passkey.name = cleaned_name
+                passkey.save(update_fields=["name"])
+                record_audit_event(
+                    workspace=user.workspace,
+                    object_type="passkey",
+                    object_id=passkey.id,
+                    record_label=passkey.name,
+                    action=AuditLog.ACTION_UPDATE,
+                    field_name="name",
+                    previous_value=previous_name,
+                    new_value=passkey.name,
+                    actor_kind=AuditLog.ACTOR_KIND_PERSON,
+                    actor_user=user,
+                )
+
+        return JsonResponse(
+            {
+                "passkey": serialize_passkey(passkey),
+                "changed": changed,
+                "message": (
+                    f'Passkey renamed to "{passkey.name}".'
+                    if changed
+                    else f'Passkey label remains "{passkey.name}".'
+                ),
+            },
+            status=200,
+        )
 
     with transaction.atomic():
         passkey = (
@@ -108,6 +163,10 @@ def passkey_delete_view(request, passkey_id: int):
         )
 
     return JsonResponse({"ok": True}, status=200)
+
+
+# Backward-compatible alias for URL/test imports.
+passkey_delete_view = passkey_detail_view
 
 
 @require_http_methods(["POST"])

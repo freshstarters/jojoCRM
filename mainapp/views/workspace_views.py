@@ -24,9 +24,12 @@ from ..service.catalog_service import (
     serialize_workspace_packs_detail,
     set_workspace_table_enabled,
 )
+from ..service.pipeline_service import is_deal_table_enabled
 from ..service.role_service import (
+    ALL_OBJECT_KEYS,
     user_can_manage_users_and_roles,
     user_can_manage_workspace_catalog,
+    user_has_object_right,
 )
 
 DEFAULT_AUDIT_PAGE_SIZE = 20
@@ -292,11 +295,18 @@ def workspace_audit_view(request, slug: str):
 
     qs = AuditLog.objects.filter(workspace=workspace)
     if not user_can_manage_users_and_roles(user, workspace):
+        unreadable_crm_types = {
+            obj_key
+            for obj_key in ALL_OBJECT_KEYS
+            if not user_has_object_right(user, workspace, obj_key, 'read')
+        }
+        if 'deal' in unreadable_crm_types or not is_deal_table_enabled(workspace):
+            unreadable_crm_types.update({'pipeline', 'pipeline_stage'})
         qs = qs.filter(
             Q(actor_user=user)
             | Q(object_type='user', object_id=str(user.id))
             | ~Q(object_type__in=PRIVATE_SECURITY_OBJECT_TYPES)
-        )
+        ).exclude(object_type__in=unreadable_crm_types)
 
     if actor_kind:
         qs = qs.filter(actor_kind=actor_kind)
