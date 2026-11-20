@@ -211,3 +211,89 @@ def account_password_change_view(request):
         },
         status=200,
     )
+
+
+@require_http_methods(['POST'])
+def account_password_set_view(request):
+    """Allow a signed-in verified user with no password yet to set an initial password."""
+    user, error_response = require_verified_user(request)
+    if error_response is not None:
+        return error_response
+
+    payload, parse_error = parse_json_object(request)
+    if parse_error is not None:
+        return parse_error
+
+    if user.has_usable_password():
+        return JsonResponse(
+            {
+                'error': (
+                    'A password is already configured on this account. '
+                    'Use change password instead.'
+                )
+            },
+            status=400,
+        )
+
+    new_password = payload.get('new_password')
+    password_error = validate_new_password(
+        new_password,
+        user=user,
+        required_error='New password is required.',
+    )
+    if password_error is not None:
+        return password_error
+
+    with transaction.atomic():
+        locked_user = (
+            User.objects.select_for_update(of=('self',))
+            .select_related('workspace')
+            .get(pk=user.pk)
+        )
+        if locked_user.has_usable_password():
+            return JsonResponse(
+                {
+                    'error': (
+                        'A password is already configured on this account. '
+                        'Use change password instead.'
+                    )
+                },
+                status=400,
+            )
+        locked_user.set_password(new_password)
+        locked_user.save(update_fields=['password'])
+        EmailActionToken.objects.filter(
+            user=locked_user,
+            purpose=EmailActionToken.PURPOSE_RESET_PASSWORD,
+            used_at__isnull=True,
+        ).update(used_at=timezone.now())
+        invalidate_user_sessions(
+            locked_user,
+            exclude_session_key=request.session.session_key,
+        )
+        record_audit_event(
+            workspace=locked_user.workspace,
+            object_type='user',
+            object_id=locked_user.id,
+            record_label=locked_user.email,
+            action=AuditLog.ACTION_UPDATE,
+            field_name='password',
+            previous_value='Not set',
+            new_value='Configured',
+            actor_kind=AuditLog.ACTOR_KIND_PERSON,
+            actor_user=locked_user,
+        )
+
+    user.password = locked_user.password
+    user.session_version = locked_user.session_version
+    update_session_auth_hash(request, user)
+    sync_session_version(request, user)
+
+    return JsonResponse(
+        {
+            'ok': True,
+            'has_password': True,
+            'message': 'Your password has been set.',
+        },
+        status=200,
+    )

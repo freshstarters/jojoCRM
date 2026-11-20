@@ -28,6 +28,7 @@ from ..service.catalog_service import (
     initialize_workspace_catalog,
     resolve_business_type,
 )
+from ..service.pipeline_service import ensure_workspace_pipeline
 from ..service.email_service import (
     EmailDeliveryError,
     EmailThrottledError,
@@ -199,6 +200,8 @@ def signup_view(request):
                 business_type_def.key,
                 actor_user=user,
             )
+            if 'deal' in business_type_def.pack_objects:
+                ensure_workspace_pipeline(workspace, require_enabled=False)
             record_audit_event(
                 workspace=workspace,
                 object_type="workspace",
