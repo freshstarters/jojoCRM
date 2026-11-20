@@ -14,3 +14,4 @@ Story documentation:
 - [docs/S2_0_BUSINESS_TYPE_AND_PACKS.md](docs/S2_0_BUSINESS_TYPE_AND_PACKS.md) — S2.0 20-type workspace catalog, starter packs, Contact labels, empty-table protection, and URL pane/subtab persistence.
 - [docs/S2_1_CORE_AND_PACK_OBJECTS.md](docs/S2_1_CORE_AND_PACK_OBJECTS.md) — S2.1 Account, Contact, Lead, Deal, Activity, Job, Appointment, and Ticket models, CRUD APIs, role permissions matrix, and workspace panes.
 - [docs/S2_2_LEAD_CONVERSION.md](docs/S2_2_LEAD_CONVERSION.md) — S2.2 Lead-to-Deal conversion, Account/Contact match detection and reuse, double-conversion protection, converted Lead locks, and pack gating.
+- [docs/S2_3_PIPELINE.md](docs/S2_3_PIPELINE.md) — S2.3 Editable sales pipeline stages, stage reordering and removal with deal reassignment, interactive Deals Kanban board, and Healthcare pack gating.
